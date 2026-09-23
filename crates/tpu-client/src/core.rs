@@ -83,6 +83,26 @@ pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
 pub const PACKET_DATA_SIZE: usize = 1232;
 
+/// Largest SIMD-0385 v1 transaction; copied from `solana_message::v1::MAX_TRANSACTION_SIZE`.
+pub const V1_MAX_TRANSACTION_SIZE: usize = 4096;
+
+/// First wire byte of a v1 transaction; copied from `solana_message::v1::V1_PREFIX`.
+/// v1 writes its message, version byte first, ahead of the signatures, while legacy
+/// and v0 open with the short-vec signature count, which is always below `0x80`.
+const V1_TX_PREFIX: u8 = 0x81;
+
+///
+/// Wire-size ceiling for a serialized transaction: [`V1_MAX_TRANSACTION_SIZE`] for v1,
+/// [`PACKET_DATA_SIZE`] for legacy and v0. Agave's sanitizer caps each version the same
+/// way, and its TPU raises the per-stream byte limit to the v1 size.
+///
+pub fn max_wire_size(wire: &[u8]) -> usize {
+    match wire.first() {
+        Some(&V1_TX_PREFIX) => V1_MAX_TRANSACTION_SIZE,
+        _ => PACKET_DATA_SIZE,
+    }
+}
+
 pub const QUIC_SEND_FAIRNESS: bool = false;
 
 ///
@@ -706,9 +726,9 @@ pub enum TxDropReason {
     #[display("remote peer is being evicted")]
     RemotePeerBeingEvicted,
     ///
-    /// The transaction is invalid.
+    /// The transaction is larger than [`max_wire_size`] allows for its version.
     ///
-    #[display("transaction packet size is exceed PACKET_DATA_SIZE (1232 bytes)")]
+    #[display("transaction exceeds its version's wire-size limit (1232 bytes, 4096 for v1)")]
     InvalidPacketSize,
     ///
     /// The remote peer identity changed.
@@ -2254,7 +2274,7 @@ where
         let tx_id = tx.tx_sig;
 
         // Check size
-        if tx.wire.len() > PACKET_DATA_SIZE && !self.config.unsafe_allow_arbitrary_txn_size {
+        if tx.wire.len() > max_wire_size(&tx.wire) && !self.config.unsafe_allow_arbitrary_txn_size {
             let tx_drop = TxDrop {
                 remote_peer_identity,
                 drop_reason: TxDropReason::InvalidPacketSize,

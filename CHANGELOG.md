@@ -18,6 +18,10 @@ The minor version will be incremented upon a breaking change and the patch versi
 - `TransactionHandler` no longer needs an RPC client.
 - Proto field `TransactionConfig.skip_sanitize` (field 2) is now reserved.
 
+### Features
+
+- tpu-client: `accept_tx` sizes each transaction by its version: SIMD-0385 v1 (first wire byte `0x81`) up to 4096 bytes, legacy and v0 still 1232. Previously every transaction over 1232 bytes was dropped as `InvalidPacketSize`.
+
 ## [14.9.1]
 
 ### Fixes
