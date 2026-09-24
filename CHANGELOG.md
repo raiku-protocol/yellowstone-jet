@@ -24,6 +24,10 @@ The minor version will be incremented upon a breaking change and the patch versi
 - tpu-client: `accept_tx` sizes each transaction by its version: SIMD-0385 v1 (first wire byte `0x81`) up to 4096 bytes, legacy and v0 still 1232. Previously every transaction over 1232 bytes was dropped as `InvalidPacketSize`.
 - tpu-client: upcoming-leader prediction re-runs every 600ms instead of every 1200ms. The old interval assumed 400ms slots; mainnet already runs ~250ms slots, and 600ms (3 x 200ms) keeps at least one refresh per leader window down to 200ms slots. `DEFAULT_TPU_SENDER_CHANNEL_CAPACITY` drops from 100,000 to 1,000. Ported from upstream rpcpool/yellowstone-jet#161.
 
+### Fixes
+
+- tpu-client: upcoming-leader prediction runs on its own timer. It used to run only when a transaction or a connection event woke the driver, so a sender with no traffic re-predicted only when an idle worker shut down, about every 10s, and never pre-connected to some upcoming leaders.
+
 ## [14.9.1]
 
 ### Fixes

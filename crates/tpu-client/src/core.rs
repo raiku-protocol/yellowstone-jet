@@ -2953,6 +2953,12 @@ where
         #[allow(unused_mut, dead_code)]
         let mut last_metric_update = Instant::now();
         let mut sleep_timer: Option<Pin<Box<Sleep>>> = None;
+        // Wakes the loop at the next prediction deadline. Without it, prediction only runs when
+        // some other event (a transaction, a connection result) happens to arrive after the deadline,
+        // so a quiet sender stops pre-connecting to upcoming leaders.
+        let mut prediction_timer = Box::pin(tokio::time::sleep_until(
+            self.next_leader_prediction_deadline.into(),
+        ));
         loop {
             self.do_eviction_if_required();
             #[cfg(feature = "prometheus")]
@@ -2963,6 +2969,11 @@ where
                 }
             }
             self.try_predict_upcoming_leaders_if_necessary();
+            let next_prediction_deadline =
+                tokio::time::Instant::from_std(self.next_leader_prediction_deadline);
+            if prediction_timer.deadline() != next_prediction_deadline {
+                prediction_timer.as_mut().reset(next_prediction_deadline);
+            }
 
             let next_connection_expiration = self.next_orphan_connection_expiration();
             match next_connection_expiration {
@@ -2995,6 +3006,9 @@ where
                 }
                 _ = async { sleep_timer.as_mut().unwrap().await }, if sleep_timer.is_some() => {
                     self.try_evict_orphan_connections();
+                }
+                () = &mut prediction_timer => {
+                    // Prediction itself runs at the top of the loop.
                 }
                 // If cnc_rx returns None, we don't care as clients can safely drop cnc sender and the runtime should keep function.
                 Some(command) = self.cnc_rx.recv() => {
