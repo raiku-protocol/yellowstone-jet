@@ -1186,6 +1186,82 @@ async fn it_should_preemptively_connect_to_upcoming_leader_using_leader_predicti
 }
 
 #[tokio::test]
+async fn it_should_keep_predicting_upcoming_leaders_without_transaction_traffic() {
+    // A sender that sends nothing must still pre-connect to the next leader once the schedule
+    // moves on, rather than waiting for a transaction to wake the driver.
+    let gateway_kp = Keypair::new();
+    let stake_info_map = MockStakeInfoMap::constant([(gateway_kp.pubkey(), 1000)]);
+
+    let first_leader = Keypair::new();
+    let second_leader = Keypair::new();
+    let mut kp_to_addr_pairs = vec![];
+    // Held so the mock validators keep a live transaction channel.
+    let mut validator_rx_vec = vec![];
+    let mut conn_establ_rx_vec = vec![];
+    for leader in [&first_leader, &second_leader] {
+        let addr = generate_random_local_addr();
+        let (tx_establish, rx_establish) = mpsc::channel(100);
+        let notifier = MockValidatorNotifiers {
+            connection_established_notify: Some(tx_establish),
+            ..Default::default()
+        };
+        let (validator_rx, _) =
+            MockedRemoteValidator::spawn(leader.insecure_clone(), addr, notifier);
+        validator_rx_vec.push(validator_rx);
+        conn_establ_rx_vec.push(rx_establish);
+        kp_to_addr_pairs.push((leader.pubkey(), addr));
+    }
+
+    let driver_spawner = TpuSenderDriverSpawner {
+        stake_info_map: Arc::new(stake_info_map),
+        leader_tpu_info_service: Arc::new(FakeLeaderTpuInfoService::from_iter(kp_to_addr_pairs)),
+        driver_tx_channel_capacity: 100,
+    };
+
+    struct SwitchableLeaderPredictor {
+        next_leader: Arc<RwLock<Pubkey>>,
+    }
+
+    impl UpcomingLeaderPredictor for SwitchableLeaderPredictor {
+        fn try_predict_next_n_leaders(&self, _n: usize) -> Vec<Pubkey> {
+            vec![*self.next_leader.read().expect("read lock")]
+        }
+    }
+
+    let next_leader = Arc::new(RwLock::new(first_leader.pubkey()));
+    // The sink must outlive the test: dropping it closes the driver's inlet and stops the driver.
+    let TpuSenderSessionContext {
+        identity_updater: _,
+        driver_tx_sink: _transaction_sink,
+        driver_join_handle: _,
+    } = driver_spawner.spawn(
+        gateway_kp.insecure_clone(),
+        TpuSenderConfig {
+            leader_prediction_lookahead: NonZeroUsize::new(1),
+            ..Default::default()
+        },
+        Arc::new(StakeBasedEvictionStrategy::default()),
+        Arc::new(SwitchableLeaderPredictor {
+            next_leader: Arc::clone(&next_leader),
+        }),
+        Some(Nothing),
+    );
+
+    let first = conn_establ_rx_vec[0].recv().await.expect("recv");
+    assert_eq!(first.remote_pubkey, gateway_kp.pubkey());
+
+    // The schedule moves on while nothing is sent. The next event that would otherwise wake the
+    // driver is the first leader's worker idling out after 10s, so a connection well before that
+    // can only come from the prediction deadline.
+    *next_leader.write().expect("write lock") = second_leader.pubkey();
+    let second = tokio::time::timeout(Duration::from_secs(3), conn_establ_rx_vec[1].recv())
+        .await
+        .expect("second leader should be pre-connected without any transaction")
+        .expect("recv");
+    assert_eq!(second.remote_pubkey, gateway_kp.pubkey());
+}
+
+#[tokio::test]
 async fn it_should_support_multiplexed_connection() {
     // Multiple remote peer validators may share the same socket address.
     // This test ensures that the gateway can handle such a scenario by
