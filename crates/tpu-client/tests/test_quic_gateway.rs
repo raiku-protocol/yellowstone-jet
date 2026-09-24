@@ -30,7 +30,8 @@ use {
             ConnectionEvictionStrategy, IgnorantLeaderPredictor, LeaderTpuInfoService, Nothing,
             PACKET_DATA_SIZE, StakeBasedEvictionStrategy, StakeSortedPeerSet,
             TpuSenderDriverSpawner, TpuSenderResponse, TpuSenderSessionContext, TpuSenderTxn,
-            TxDropReason, UpcomingLeaderPredictor, ValidatorStakeInfoService,
+            TxDropReason, UpcomingLeaderPredictor, V1_MAX_TRANSACTION_SIZE,
+            ValidatorStakeInfoService,
         },
     },
 };
@@ -852,6 +853,105 @@ async fn it_should_refuse_txn_bigger_than_1232_bytes() {
         panic!("Expected TpuSenderResponse::TxDrop");
     };
 
+    assert!(matches!(
+        actual_resp.drop_reason,
+        TxDropReason::InvalidPacketSize
+    ));
+}
+
+/// A SIMD-0385 v1 wire opens with its version byte, `0x81`.
+fn v1_wire(len: usize) -> Vec<u8> {
+    let mut wire = vec![0u8; len];
+    wire[0] = 0x81;
+    wire
+}
+
+#[tokio::test]
+async fn it_should_send_v1_txn_up_to_4096_bytes() {
+    let rx_server_addr = generate_random_local_addr();
+    let (rx_server_endpoint, rx_server_identity) = build_random_endpoint(rx_server_addr);
+
+    let gateway_kp = Keypair::new();
+    let stake_info_map = MockStakeInfoMap::constant([(gateway_kp.pubkey(), 1000)]);
+    let fake_tpu_info_service =
+        FakeLeaderTpuInfoService::from_iter([(rx_server_identity.pubkey(), rx_server_addr)]);
+
+    let gateway_spawner = TpuSenderDriverSpawner {
+        stake_info_map: Arc::new(stake_info_map.clone()),
+        leader_tpu_info_service: Arc::new(fake_tpu_info_service.clone()),
+        driver_tx_channel_capacity: 100,
+    };
+    let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+    let TpuSenderSessionContext {
+        identity_updater: _,
+        driver_tx_sink: transaction_sink,
+        driver_join_handle: _,
+    } = gateway_spawner.spawn_default_with_callback(gateway_kp.insecure_clone(), callback_tx);
+
+    // Reads each stream to its end, as Agave's TPU does up to its per-stream byte cap.
+    // `MockedRemoteValidator` gives up after four chunks, too few for a 4096-byte stream.
+    let (spy_tx, mut spy_rx) = mpsc::unbounded_channel();
+    let _rx_server_handle = tokio::spawn(async move {
+        let connecting = rx_server_endpoint.accept().await.expect("accept");
+        let conn = connecting.await.expect("quinn connection");
+        loop {
+            let mut uni = conn.accept_uni().await.expect("accept uni");
+            let data = uni
+                .read_to_end(V1_MAX_TRANSACTION_SIZE)
+                .await
+                .expect("read to end");
+            spy_tx.send(data).expect("send spy");
+        }
+    });
+
+    let tx_sig = Signature::new_unique();
+    let wire = v1_wire(V1_MAX_TRANSACTION_SIZE);
+    let txn = TpuSenderTxn::from_owned(tx_sig, rx_server_identity.pubkey(), wire.clone());
+    transaction_sink.send(txn).await.expect("send tx");
+
+    let TpuSenderResponse::TxSent(actual_resp) = callback_rx.recv().await.expect("recv response")
+    else {
+        panic!("Expected TpuSenderResponse::TxSent, got something else");
+    };
+    assert_eq!(actual_resp.tx_sig, tx_sig);
+    assert_eq!(spy_rx.recv().await.expect("recv spy"), wire);
+}
+
+#[tokio::test]
+async fn it_should_refuse_v1_txn_bigger_than_4096_bytes() {
+    let rx_server_addr = generate_random_local_addr();
+    let rx_server_identity = Keypair::new();
+
+    let gateway_kp = Keypair::new();
+    let stake_info_map = MockStakeInfoMap::constant([(gateway_kp.pubkey(), 1000)]);
+    let fake_tpu_info_service =
+        FakeLeaderTpuInfoService::from_iter([(rx_server_identity.pubkey(), rx_server_addr)]);
+
+    let gateway_spawner = TpuSenderDriverSpawner {
+        stake_info_map: Arc::new(stake_info_map.clone()),
+        leader_tpu_info_service: Arc::new(fake_tpu_info_service.clone()),
+        driver_tx_channel_capacity: 100,
+    };
+    let (callback_tx, mut callback_rx) = mpsc::unbounded_channel();
+    let TpuSenderSessionContext {
+        identity_updater: _,
+        driver_tx_sink: transaction_sink,
+        driver_join_handle: _,
+    } = gateway_spawner.spawn_default_with_callback(gateway_kp.insecure_clone(), callback_tx);
+
+    // Refused in `accept_tx` before any connection is attempted, so no server is needed.
+    let tx_sig = Signature::new_unique();
+    let txn = TpuSenderTxn::from_owned(
+        tx_sig,
+        rx_server_identity.pubkey(),
+        v1_wire(V1_MAX_TRANSACTION_SIZE + 1),
+    );
+    transaction_sink.send(txn).await.expect("send tx");
+
+    let TpuSenderResponse::TxDrop(actual_resp) = callback_rx.recv().await.expect("recv response")
+    else {
+        panic!("Expected TpuSenderResponse::TxDrop");
+    };
     assert!(matches!(
         actual_resp.drop_reason,
         TxDropReason::InvalidPacketSize

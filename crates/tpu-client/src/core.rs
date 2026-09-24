@@ -83,6 +83,26 @@ pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
 pub const PACKET_DATA_SIZE: usize = 1232;
 
+/// Largest SIMD-0385 v1 transaction; copied from `solana_message::v1::MAX_TRANSACTION_SIZE`.
+pub const V1_MAX_TRANSACTION_SIZE: usize = 4096;
+
+/// First wire byte of a v1 transaction; copied from `solana_message::v1::V1_PREFIX`.
+/// v1 writes its message, version byte first, ahead of the signatures, while legacy
+/// and v0 open with the short-vec signature count, which is always below `0x80`.
+const V1_TX_PREFIX: u8 = 0x81;
+
+///
+/// Wire-size ceiling for a serialized transaction: [`V1_MAX_TRANSACTION_SIZE`] for v1,
+/// [`PACKET_DATA_SIZE`] for legacy and v0. Agave's sanitizer caps each version the same
+/// way, and its TPU raises the per-stream byte limit to the v1 size.
+///
+pub fn max_wire_size(wire: &[u8]) -> usize {
+    match wire.first() {
+        Some(&V1_TX_PREFIX) => V1_MAX_TRANSACTION_SIZE,
+        _ => PACKET_DATA_SIZE,
+    }
+}
+
 pub const QUIC_SEND_FAIRNESS: bool = false;
 
 ///
@@ -94,7 +114,15 @@ pub const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default duration after which an unused connection is evicted.
 pub const DEFAULT_UNUSED_CONNECTION_TTL: Duration = Duration::from_secs(10);
 
-pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_secs(2); // 400ms * 4 rounded to seconds
+/// since agave 4.2 we should expect lower leader duration as they go from 400 -> 350 -> 300 -> 250 -> 200ms.
+/// though this constant is only used during eviction, and as a grace period.
+/// essentially, when a new connection is establish because of a new leader round, the connection should
+/// be un-evictable for 2 seconds. Even if the leader duration is 200ms,
+/// it should be acceptable to give a connection 2 seconds of grace period before it can be evicted.
+///
+/// Once mainnet has migrated fully to 200ms, we could decide if it's worth changing.
+/// Giving more should not impact the performance or the runtime of the driver.
+pub const DEFAULT_EVICTION_GRACE_DURATION: Duration = Duration::from_secs(2); // 400ms * 4 rounded to seconds
 
 /// Keep-alive interval for QUIC connections.
 /// The rate at which we send PING frames to keep the connection alive.
@@ -706,9 +734,9 @@ pub enum TxDropReason {
     #[display("remote peer is being evicted")]
     RemotePeerBeingEvicted,
     ///
-    /// The transaction is invalid.
+    /// The transaction is larger than [`max_wire_size`] allows for its version.
     ///
-    #[display("transaction packet size is exceed PACKET_DATA_SIZE (1232 bytes)")]
+    #[display("transaction exceeds its version's wire-size limit (1232 bytes, 4096 for v1)")]
     InvalidPacketSize,
     ///
     /// The remote peer identity changed.
@@ -1425,7 +1453,7 @@ pub struct StakeBasedEvictionStrategy {
 impl Default for StakeBasedEvictionStrategy {
     fn default() -> Self {
         Self {
-            peer_idle_eviction_grace_period: DEFAULT_LEADER_DURATION,
+            peer_idle_eviction_grace_period: DEFAULT_EVICTION_GRACE_DURATION,
         }
     }
 }
@@ -2254,7 +2282,7 @@ where
         let tx_id = tx.tx_sig;
 
         // Check size
-        if tx.wire.len() > PACKET_DATA_SIZE && !self.config.unsafe_allow_arbitrary_txn_size {
+        if tx.wire.len() > max_wire_size(&tx.wire) && !self.config.unsafe_allow_arbitrary_txn_size {
             let tx_drop = TxDrop {
                 remote_peer_identity,
                 drop_reason: TxDropReason::InvalidPacketSize,
@@ -2812,10 +2840,12 @@ where
             .leader_prediction_lookahead
             .map(|nz| nz.get() as u64)
         {
+            const MINIMAL_SLOT_DURATION_SINCE_AGAVE_4_2: Duration = Duration::from_millis(200);
             // Predict every 3 slot.
-            let wait_dur_ms = DEFAULT_MS_PER_SLOT * (NUM_CONSECUTIVE_LEADER_SLOTS - 1);
-            let wait_dur =
-                Duration::from_millis(wait_dur_ms).max(Duration::from_millis(DEFAULT_MS_PER_SLOT));
+            let wait_dur_ms = MINIMAL_SLOT_DURATION_SINCE_AGAVE_4_2.as_millis()
+                * (NUM_CONSECUTIVE_LEADER_SLOTS - 1) as u128;
+            let wait_dur = Duration::from_millis(wait_dur_ms as u64)
+                .max(Duration::from_millis(DEFAULT_MS_PER_SLOT));
             self.next_leader_prediction_deadline = Instant::now() + wait_dur;
 
             let upcoming_leaders = self
