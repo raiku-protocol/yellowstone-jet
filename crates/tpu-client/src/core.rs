@@ -114,7 +114,15 @@ pub const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default duration after which an unused connection is evicted.
 pub const DEFAULT_UNUSED_CONNECTION_TTL: Duration = Duration::from_secs(10);
 
-pub const DEFAULT_LEADER_DURATION: Duration = Duration::from_secs(2); // 400ms * 4 rounded to seconds
+/// since agave 4.2 we should expect lower leader duration as they go from 400 -> 350 -> 300 -> 250 -> 200ms.
+/// though this constant is only used during eviction, and as a grace period.
+/// essentially, when a new connection is establish because of a new leader round, the connection should
+/// be un-evictable for 2 seconds. Even if the leader duration is 200ms,
+/// it should be acceptable to give a connection 2 seconds of grace period before it can be evicted.
+///
+/// Once mainnet has migrated fully to 200ms, we could decide if it's worth changing.
+/// Giving more should not impact the performance or the runtime of the driver.
+pub const DEFAULT_EVICTION_GRACE_DURATION: Duration = Duration::from_secs(2); // 400ms * 4 rounded to seconds
 
 /// Keep-alive interval for QUIC connections.
 /// The rate at which we send PING frames to keep the connection alive.
@@ -1445,7 +1453,7 @@ pub struct StakeBasedEvictionStrategy {
 impl Default for StakeBasedEvictionStrategy {
     fn default() -> Self {
         Self {
-            peer_idle_eviction_grace_period: DEFAULT_LEADER_DURATION,
+            peer_idle_eviction_grace_period: DEFAULT_EVICTION_GRACE_DURATION,
         }
     }
 }
@@ -2832,10 +2840,12 @@ where
             .leader_prediction_lookahead
             .map(|nz| nz.get() as u64)
         {
+            const MINIMAL_SLOT_DURATION_SINCE_AGAVE_4_2: Duration = Duration::from_millis(200);
             // Predict every 3 slot.
-            let wait_dur_ms = DEFAULT_MS_PER_SLOT * (NUM_CONSECUTIVE_LEADER_SLOTS - 1);
-            let wait_dur =
-                Duration::from_millis(wait_dur_ms).max(Duration::from_millis(DEFAULT_MS_PER_SLOT));
+            let wait_dur_ms = MINIMAL_SLOT_DURATION_SINCE_AGAVE_4_2.as_millis()
+                * (NUM_CONSECUTIVE_LEADER_SLOTS - 1) as u128;
+            let wait_dur = Duration::from_millis(wait_dur_ms as u64)
+                .max(Duration::from_millis(DEFAULT_MS_PER_SLOT));
             self.next_leader_prediction_deadline = Instant::now() + wait_dur;
 
             let upcoming_leaders = self

@@ -17,10 +17,12 @@ The minor version will be incremented upon a breaking change and the patch versi
 - Removed `proxy_preflight_check`. Transactions with `skip_preflight: false` are now rejected with an error.
 - `TransactionHandler` no longer needs an RPC client.
 - Proto field `TransactionConfig.skip_sanitize` (field 2) is now reserved.
+- tpu-client: `core::DEFAULT_LEADER_DURATION` is renamed `DEFAULT_EVICTION_GRACE_DURATION` (value unchanged, 2s), from upstream rpcpool/yellowstone-jet#161.
 
 ### Features
 
 - tpu-client: `accept_tx` sizes each transaction by its version: SIMD-0385 v1 (first wire byte `0x81`) up to 4096 bytes, legacy and v0 still 1232. Previously every transaction over 1232 bytes was dropped as `InvalidPacketSize`.
+- tpu-client: upcoming-leader prediction re-runs every 600ms instead of every 1200ms, sized for the 200ms slots Agave 4.2+ moves towards; `DEFAULT_TPU_SENDER_CHANNEL_CAPACITY` drops from 100,000 to 1,000. Ported from upstream rpcpool/yellowstone-jet#161.
 
 ## [14.9.1]
 
