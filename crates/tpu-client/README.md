@@ -45,7 +45,7 @@ use {
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt},
     yellowstone_jet_tpu_client::{
-        core::TpuSenderResponse,
+        core::{TpuSenderResponse, TpuSenderTxnInfo},
         yellowstone_grpc::sender::{
             Endpoints, NewYellowstoneTpuSender, create_yellowstone_tpu_sender,
         },
@@ -186,10 +186,11 @@ async fn main() {
     let signature = transaction.signatures[0];
     tracing::info!("generate transaction {signature} with send lamports {LAMPORTS}");
     let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
+    let txn_info = TpuSenderTxnInfo::new(signature);
 
     // Send the transaction to the current leader
     sender
-        .send_txn(signature, bincoded_txn)
+        .send_txn(bincoded_txn, Some(txn_info))
         .await
         .expect("send_transaction");
 
@@ -197,17 +198,160 @@ async fn main() {
         panic!("unexpected response");
     };
 
-    assert!(
-        resp.tx_sig == signature,
-        "unexpected tx signature in response"
-    );
+    let actual_sig = resp
+        .info
+        .as_ref()
+        .and_then(|info| info.downcast_ref::<Signature>())
+        .copied()
+        .expect("response contains Signature metadata");
+    assert!(actual_sig == signature, "unexpected tx signature in response");
+
     writeln!(
         &mut out,
         "sent transaction with signature `{}` to validator `{}`",
-        resp.tx_sig, resp.remote_peer_identity
+        actual_sig, resp.remote_peer_identity
     )
     .expect("writeln");
 }
+```
+
+## `HardenedKeypair`: memory-hardened keypair loading
+
+The `Usage` example above loads the identity with `solana_keypair::read_keypair_file`, which reads
+the whole keypair file into an ordinary, unlocked `String` before parsing it -- the private key
+exists, at least transiently, in memory that can be swapped to disk and isn't wiped on drop.
+
+`HardenedKeypair` (in the `identity` module) is a drop-in alternative that keeps the private key
+`mlock`ed and zeroized on drop from the moment it first exists, and never copies it into an
+unlocked allocation on the way in.
+
+Construct one via:
+
+- `HardenedKeypair::read_from_file(path)` / `read_from_reader(&mut reader)` -- parses the same
+  JSON `[u8; 64]` keypair file format as `solana_keypair`, without ever putting the file's text
+  (which spells the secret out in ASCII) into an unlocked buffer.
+- `HardenedKeypair::new()` -- generates a fresh random one.
+- `HardenedKeypair::from_keypair(&keypair)` -- wraps an existing `solana_keypair::Keypair`.
+- `HardenedKeypair::try_from(&bytes[..])` -- parses raw 64-byte keypair bytes, rejecting the
+  pair if the public half doesn't actually correspond to the secret half.
+
+It implements `TpuEd25519SigningKey`, so it plugs directly into
+`TpuIdentity::from_ed25519_signing_key`, which builds the QUIC client TLS identity used by the
+sender -- a plain `Keypair` never needs to exist on the way there:
+
+```rust
+use yellowstone_jet_tpu_client::identity::{HardenedKeypair, TpuIdentity};
+
+let hardened = HardenedKeypair::read_from_file("/path/to/identity.json")
+    .expect("read identity keypair file");
+
+println!("identity pubkey: {}", hardened.pubkey());
+
+let identity = TpuIdentity::from_ed25519_signing_key(&hardened);
+```
+
+The resulting `identity` is what you pass to `create_yellowstone_tpu_sender`/
+`YellowstoneTpuSender`, exactly as a `TpuIdentity::from_keypair(&keypair)` would be in the
+`Usage` example above -- the rest of the sender setup is unchanged.
+
+## `TpuSenderTxnInfo` detailed usage
+
+`TpuSenderTxnInfo` is an optional typed metadata envelope attached to each `TpuSenderTxn`.
+`TpuSenderResponse` carries this metadata back in `TxSent`, `TxFailed`, and `TxDrop` responses.
+
+Key points:
+
+- The value must be `Copy + Sized + 'static`.
+- The encoded value must fit in `TXN_INFO_CAP` bytes.
+- You recover the original type using `downcast_ref::<T>()`.
+
+```rust
+use {
+    solana_signature::Signature,
+    yellowstone_jet_tpu_client::core::{TpuSenderResponse, TpuSenderTxnInfo, TXN_INFO_CAP},
+};
+
+#[derive(Clone, Copy, Debug)]
+struct TxMeta {
+    sig: Signature,
+    attempt: u16,
+}
+
+fn read_meta(info: &Option<TpuSenderTxnInfo>) -> Option<TxMeta> {
+    info.as_ref().and_then(|i| i.downcast_ref::<TxMeta>()).copied()
+}
+
+async fn send_with_metadata(
+    sender: &mut yellowstone_jet_tpu_client::yellowstone_grpc::sender::YellowstoneTpuSender,
+    wire: Vec<u8>,
+    sig: Signature,
+) {
+    assert!(std::mem::size_of::<TxMeta>() <= TXN_INFO_CAP);
+    let meta = TxMeta { sig, attempt: 1 };
+
+    sender
+        .send_txn(wire, Some(TpuSenderTxnInfo::new(meta)))
+        .await
+        .expect("send_txn");
+}
+
+fn handle_response(resp: TpuSenderResponse) {
+    match resp {
+        TpuSenderResponse::TxSent(ok) => {
+            if let Some(meta) = read_meta(&ok.info) {
+                println!("sent {} attempt {}", meta.sig, meta.attempt);
+            }
+        }
+        TpuSenderResponse::TxFailed(err) => {
+            if let Some(meta) = read_meta(&err.info) {
+                println!("failed {}: {}", meta.sig, err.failure_reason);
+            }
+        }
+        TpuSenderResponse::TxDrop(drop) => {
+            for (txn, _attempt) in drop.dropped_tx_vec {
+                if let Some(meta) = read_meta(&txn.info) {
+                    println!("dropped {}", meta.sig);
+                }
+            }
+        }
+    }
+}
+```
+
+In simple flows, storing only `Signature` is enough:
+
+```rust
+let txn_info = TpuSenderTxnInfo::new(signature);
+sender.send_txn(wire_txn, Some(txn_info)).await?;
+```
+
+## Compile-time metadata capacity (`TXN_INFO_CAP`)
+
+`TpuSenderTxnInfo` storage capacity is a compile-time constant generated by `build.rs`.
+
+- Env var: `TXN_INFO_CAP`
+- Default: `64` bytes
+- Validation: must be greater than `0`
+
+Set it for a one-off build:
+
+```sh
+TXN_INFO_CAP=128 cargo build -p yellowstone-jet-tpu-client
+```
+
+Run tests with a custom capacity:
+
+```sh
+TXN_INFO_CAP=256 cargo test -p yellowstone-jet-tpu-client --all-features
+```
+
+You can verify the active compiled value in code:
+
+```rust
+use yellowstone_jet_tpu_client::TXN_INFO_CAP;
+
+println!("TXN_INFO_CAP={}", TXN_INFO_CAP);
+assert!(std::mem::size_of::<TxMeta>() <= TXN_INFO_CAP);
 ```
 
 

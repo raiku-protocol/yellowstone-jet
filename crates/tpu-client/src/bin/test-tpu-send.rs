@@ -18,10 +18,12 @@ use {
     },
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt},
+    url::Url,
     yellowstone_jet_tpu_client::{
-        core::TpuSenderResponse,
+        core::{TpuSenderResponse, TpuSenderTxnInfo},
+        identity::TpuIdentity,
         yellowstone_grpc::sender::{
-            Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender,
+            Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender, YellowstoneTpuSenderConfig,
             create_yellowstone_tpu_sender_with_callback,
         },
     },
@@ -58,11 +60,12 @@ async fn send_lamports(
     .expect("try_new");
     let signature = transaction.signatures[0];
     tracing::info!("generate transaction {signature} with send lamports {lamports}");
-    let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
+    let bincoded_txn = wincode::serialize(&transaction).expect("wincode::serialize");
 
+    let txn_info = TpuSenderTxnInfo::new(signature);
     // Send the transaction to the current leader
     tpu_sender
-        .send_txn(signature, bincoded_txn)
+        .send_txn(bincoded_txn, Some(txn_info))
         .await
         .expect("send_transaction");
 
@@ -92,14 +95,20 @@ async fn main() {
 
     let rpc_endpoint = match args.rpc {
         Some(endpoint) => endpoint,
-        None => env::var("RPC_ENDPOINT")
-            .expect("RPC_ENDPOINT must be set in dotenv file or environment"),
+        None => Url::parse(
+            &env::var("RPC_ENDPOINT")
+                .expect("RPC_ENDPOINT must be set in dotenv file or environment"),
+        )
+        .expect("Failed to parse RPC_ENDPOINT"),
     };
 
     let grpc_endpoint = match args.grpc {
         Some(endpoint) => endpoint,
-        None => env::var("GRPC_ENDPOINT")
-            .expect("GRPC_ENDPOINT must be set in dotenv file or environment"),
+        None => Url::parse(
+            &env::var("GRPC_ENDPOINT")
+                .expect("GRPC_ENDPOINT must be set in dotenv file or environment"),
+        )
+        .expect("Failed to parse GRPC_ENDPOINT"),
     };
 
     let grpc_x_token = match args.x_token {
@@ -131,7 +140,7 @@ async fn main() {
     };
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
-        rpc_endpoint.clone(),
+        rpc_endpoint.to_string(),
         CommitmentConfig::confirmed(),
     ));
 
@@ -141,19 +150,20 @@ async fn main() {
         grpc: grpc_endpoint,
         grpc_x_token,
     };
+    let config = YellowstoneTpuSenderConfig {
+        endpoints,
+        ..Default::default()
+    };
+
+    let tpu_identity = TpuIdentity::from_keypair(&identity);
 
     let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
     let NewYellowstoneTpuSender {
         sender,
         related_objects_jh: _,
-    } = create_yellowstone_tpu_sender_with_callback(
-        Default::default(),
-        identity.insecure_clone(),
-        endpoints,
-        callback_tx,
-    )
-    .await
-    .expect("tpu-sender");
+    } = create_yellowstone_tpu_sender_with_callback(config, tpu_identity, callback_tx)
+        .await
+        .expect("tpu-sender");
 
     const LAMPORTS: u64 = 1000;
 
@@ -178,15 +188,24 @@ async fn main() {
         panic!("unexpected tpu sender response");
     };
 
+    let Some(txn_info) = resp.info else {
+        panic!("unexpected tpu sender response without txn info");
+    };
+
+    let actual_sig = txn_info
+        .downcast_ref::<Signature>()
+        .copied()
+        .expect("downcast_ref::<Signature>");
+
     assert!(
-        resp.tx_sig == signature,
+        actual_sig == signature,
         "unexpected tx signature in response"
     );
 
     writeln!(
         &mut out,
         "sent transaction with signature `{}` to validator `{}`",
-        resp.tx_sig, resp.remote_peer_identity
+        actual_sig, resp.remote_peer_identity
     )
     .expect("writeln");
 }
@@ -198,9 +217,9 @@ struct Args {
     dotenv: Option<PathBuf>,
     /// Endpoint to Yellowstone gRPC service
     #[clap(long, short)]
-    rpc: Option<String>,
+    rpc: Option<Url>,
     #[clap(long, short)]
-    grpc: Option<String>,
+    grpc: Option<Url>,
     /// X-Token for Yellowstone gRPC service
     x_token: Option<String>,
     ///

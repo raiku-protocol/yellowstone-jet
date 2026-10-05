@@ -85,8 +85,6 @@ pub mod jet {
             &["kind"]
         ).unwrap();
 
-        static ref ROOTED_TRANSACTIONS_POOL_SIZE: IntGauge = IntGauge::new("rooted_transactions_pool_size", "Total number of transactions in landed pool").unwrap();
-
         static ref STS_POOL_SIZE: IntGauge = IntGauge::new("sts_pool_size", "Number of transactions in the pool").unwrap();
         static ref STS_INFLIGHT_SIZE: IntGauge = IntGauge::new("sts_inflight_size", "Number of transactions sending right now").unwrap();
         static ref STS_RECEIVED_TOTAL: IntCounter = IntCounter::new("sts_received_total", "Total number of received transactions").unwrap();
@@ -231,6 +229,11 @@ pub mod jet {
             HistogramOpts::new("http_tx_request_duration_seconds", "HTTP transaction endpoint request duration in seconds")
                 .buckets(vec![0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0])
         ).unwrap();
+
+        static ref STALLED_TPU_ACTIVITY: IntGauge = IntGauge::new(
+            "jet_tpu_forwarding_stalled", "Whether TPU forwarding meets the stall condition in the trailing 30-second activity window (1 stalled, 0 otherwise)"
+        ).unwrap();
+
     }
 
     pub fn init() {
@@ -247,7 +250,6 @@ pub mod jet {
             register!(GATEWAY_CONNECTED);
             register!(GRPC_SLOT_RECEIVED);
 
-            register!(ROOTED_TRANSACTIONS_POOL_SIZE);
             register!(SEND_TRANSACTION_ATTEMPT);
             register!(SEND_TRANSACTION_ERROR);
             register!(SEND_TRANSACTION_SUCCESS);
@@ -278,10 +280,19 @@ pub mod jet {
             register!(VERSIONED_TXN_HANDLE_ERROR);
             register!(HTTP_TX_REQUESTS);
             register!(HTTP_TX_REQUEST_DURATION);
+            register!(STALLED_TPU_ACTIVITY);
 
             yellowstone_jet_tpu_client::prom::register_metrics(&REGISTRY);
             grpc_lewis::prom::register_metrics(&REGISTRY);
         });
+    }
+
+    pub fn set_stalled_tpu_activity(stalled: bool) {
+        if stalled {
+            STALLED_TPU_ACTIVITY.set(1);
+        } else {
+            STALLED_TPU_ACTIVITY.set(0);
+        }
     }
 
     pub fn incr_versioned_txn_handler_error(error_type: &str) {
@@ -348,11 +359,6 @@ pub mod jet {
             "no information about leaders"
         );
 
-        anyhow::ensure!(
-            ROOTED_TRANSACTIONS_POOL_SIZE.get() > 0,
-            "no transactions in the landing pool"
-        );
-
         Ok(())
     }
 
@@ -411,10 +417,6 @@ pub mod jet {
             .get()
             .try_into()
             .expect("failed to convert to u64")
-    }
-
-    pub fn rooted_transactions_pool_set_size(size: usize) {
-        ROOTED_TRANSACTIONS_POOL_SIZE.set(size as i64)
     }
 
     pub fn sts_pool_set_size(size: usize) {

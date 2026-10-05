@@ -1,6 +1,7 @@
 use {
-    crate::{feature_flags::FeatureSet, util::CommitmentLevel},
+    crate::txn_trace_drain::HttpTxnTraceDrainConfig,
     anyhow::Context,
+    reqwest::Url,
     serde::{
         Deserialize,
         de::{self, Deserializer},
@@ -10,7 +11,7 @@ use {
     std::{
         collections::HashSet,
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        num::{NonZeroU64, NonZeroUsize},
+        num::NonZeroUsize,
         path::{Path, PathBuf},
         str::FromStr,
     },
@@ -55,9 +56,6 @@ pub struct ConfigJet {
     /// RPC & gRPC for upstream validator
     pub upstream: ConfigUpstream,
 
-    /// jet-gateway endpoints
-    pub jet_gateway: Option<ConfigJetGatewayClient>,
-
     /// Admin server listen options
     pub listen_admin: ConfigListenAdmin,
 
@@ -65,7 +63,14 @@ pub struct ConfigJet {
     pub listen_solana_like: ConfigListenSolanaLike,
 
     /// Send retry options
-    pub send_transaction_service: ConfigSendTransactionService,
+    #[serde(default)]
+    pub send_transaction_service: Option<ConfigSendTransactionService>,
+
+    #[serde(default)]
+    #[deprecated(
+        note = "This option is deprecated and is ignored. Use `enable_yellowstone_shield` instead."
+    )]
+    pub features: Option<de::IgnoredAny>,
 
     /// Quic config
     pub quic: ConfigQuic,
@@ -73,12 +78,8 @@ pub struct ConfigJet {
     /// Send events to Lewis
     pub lewis_events: Option<ConfigLewisEvents>,
 
-    /// Features Flags
-    #[serde(default)]
-    pub features: FeatureSet,
-
-    /// Prometheus Push Gateway
-    pub prometheus: Option<PrometheusConfig>,
+    #[serde(default = "default_true")]
+    pub enable_yellowstone_shield: bool,
 
     /// Shield Program ID (Optional, default to yellowstone-shield-store default)
     #[serde(default, deserialize_with = "ConfigJet::deserialize_maybe_program_id")]
@@ -88,6 +89,18 @@ pub struct ConfigJet {
     /// This is useful for debugging transaction handling errors, but may cause log spam if there are many invalid transactions.
     #[serde(default)]
     pub log_invalid_txn: bool,
+
+    /// If `url` fails to parse, this is treated as absent (`None`, with a warning logged)
+    /// rather than failing config load entirely -- see `ConfigJet::deserialize_http_txn_trace_drain`.
+    #[serde(
+        default,
+        deserialize_with = "ConfigJet::deserialize_http_txn_trace_drain"
+    )]
+    pub http_txn_trace_drain: Option<HttpTxnTraceDrainConfig>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl ConfigJet {
@@ -100,6 +113,41 @@ impl ConfigJet {
                 .map(Some)
                 .map_err(de::Error::custom),
             None => Ok(None),
+        }
+    }
+
+    ///
+    /// Deserializes `http_txn_trace_drain` leniently: if the value present fails to deserialize
+    /// into `HttpTxnTraceDrainConfig` for *any* reason (a bad `url`, a malformed `credentials`
+    /// block, a wrong type, ...), that's treated the same as the field being absent (`None`,
+    /// with a warning logged) instead of failing config load for the whole process.
+    ///
+    /// This has to go through an intermediate, format-native [`serde_yaml::Value`] rather than
+    /// deserializing `HttpTxnTraceDrainConfig` from `deserializer` directly: a `Deserializer` is
+    /// generally single-use (many formats can't rewind and try again), so attempting the real
+    /// type first and falling back on failure isn't an option -- there'd be nothing left to
+    /// deserialize a fallback from. Buffering into a `Value` first (self-describing, freely
+    /// re-deserializable) is what makes "try it, and turn a failure into `None`" possible at all.
+    ///
+    fn deserialize_http_txn_trace_drain<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<HttpTxnTraceDrainConfig>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let Some(value) = Option::<serde_yaml::Value>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+
+        match HttpTxnTraceDrainConfig::deserialize(value) {
+            Ok(config) => Ok(Some(config)),
+            Err(error) => {
+                tracing::warn!(
+                    "failed to deserialize http_txn_trace_drain ({error}); \
+                     disabling http_txn_trace_drain"
+                );
+                Ok(None)
+            }
         }
     }
 }
@@ -159,7 +207,7 @@ pub struct ConfigUpstream {
 
     /// RPC endpoint
     #[serde(default = "ConfigUpstream::default_rpc")]
-    pub rpc: String,
+    pub rpc: Url,
 
     ///
     /// RPC retry strategy
@@ -190,8 +238,8 @@ impl ConfigUpstream {
         }
     }
 
-    fn default_rpc() -> String {
-        "http://127.0.0.1:8899".to_owned()
+    fn default_rpc() -> Url {
+        Url::parse("http://127.0.0.1:8899").unwrap()
     }
 
     const fn default_cluster_nodes_update_interval() -> Duration {
@@ -207,15 +255,15 @@ impl ConfigUpstream {
 pub struct ConfigUpstreamGrpc {
     /// gRPC service endpoint
     #[serde(default = "ConfigUpstreamGrpc::default_endpoint")]
-    pub endpoint: String,
+    pub endpoint: Url,
 
     /// Optional token for access to gRPC
     pub x_token: Option<String>,
 }
 
 impl ConfigUpstreamGrpc {
-    fn default_endpoint() -> String {
-        "http://127.0.0.1:10000".to_owned()
+    fn default_endpoint() -> Url {
+        Url::parse("http://127.0.0.1:10000").unwrap()
     }
 }
 
@@ -228,9 +276,11 @@ impl From<ConfigUpstream> for PolicyStoreConfig {
         } = config;
 
         PolicyStoreConfig {
-            rpc: PolicyStoreRpcConfig { endpoint: rpc },
+            rpc: PolicyStoreRpcConfig {
+                endpoint: rpc.to_string(),
+            },
             grpc: PolicyStoreGrpcConfig {
-                endpoint,
+                endpoint: endpoint.to_string(),
                 x_token,
                 max_decoding_message_size: Some(100_000_000),
                 commitment: Some(ShieldStoreCommitmentLevel::Confirmed),
@@ -249,46 +299,6 @@ impl From<ConfigUpstream> for PolicyStoreConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct ConfigJetGatewayClient {
-    /// gRPC service endpoints, only one connection would be used
-    pub endpoints: Vec<String>,
-
-    /// Access token
-    pub x_token: Option<String>,
-
-    /// Maximum number of permit that can be received from jet-gateway, overrides staked-based stream computation.
-    /// If set to `None`, then stream size would be computed based on stake.
-    /// It is clipped to the maximum staked-based stream size.
-    #[serde(
-        default,
-        deserialize_with = "ConfigJetGatewayClient::deserialize_maybe_nonzero_u64"
-    )]
-    pub max_streams: Option<NonZeroU64>,
-
-    ///
-    /// Maximum number of subscribe attempts to the jet-gateway.
-    /// If set to `None`, then it would be infinite.
-    #[serde(default = "ConfigJetGatewayClient::default_maximum_subscribe_attempts")]
-    pub maximum_subscribe_attempts: Option<NonZeroUsize>,
-}
-
-impl ConfigJetGatewayClient {
-    fn deserialize_maybe_nonzero_u64<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<NonZeroU64>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // If 0 then fallback to None.
-        Ok(Option::<u64>::deserialize(deserializer)?.and_then(NonZeroU64::new))
-    }
-
-    const fn default_maximum_subscribe_attempts() -> Option<NonZeroUsize> {
-        None
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigListenAdmin {
@@ -302,39 +312,20 @@ pub struct ConfigListenSolanaLike {
     /// RPC listen addresses
     #[serde(deserialize_with = "deserialize_listen")]
     pub bind: Vec<SocketAddr>,
+    ///
+    /// If true (default), the handler will reject transactions that request preflight checks, as preflight is not supported.
+    #[serde(default = "default_true")]
+    pub fail_on_preflight: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConfigSendTransactionService {
-    /// Default max retries of sending transaction
-    pub default_max_retries: Option<usize>,
-
-    /// Service max retries
-    #[serde(default = "ConfigSendTransactionService::default_service_max_retries")]
-    pub service_max_retries: usize,
-
-    /// Stop send transaction when landed at specified commitment
-    #[serde(default = "ConfigSendTransactionService::default_stop_send_on_commitment")]
-    pub stop_send_on_commitment: CommitmentLevel,
-
     /// The number of upcoming leaders to which to forward transactions
     #[deprecated(
         note = "jet already implements smart fanout based on slot timing. Having too high fanout creates jitter."
     )]
     #[serde(default = "ConfigSendTransactionService::default_leader_forward_count")]
     pub leader_forward_count: Option<usize>,
-
-    /// Try to send transaction every retry_rate duration
-    #[serde(
-        default = "ConfigSendTransactionService::default_retry_rate",
-        with = "humantime_serde"
-    )]
-    pub retry_rate: Duration,
-
-    /// Drop transactions from the pool once max retries limit is reached (landed statistic would be invalid)
-    #[serde(default)]
-    pub relay_only_mode: bool,
 
     /// Extra forward (transactions would be always sent to these nodes)
     /// regardless of the transaction yellowstone-shield policies.
@@ -343,20 +334,8 @@ pub struct ConfigSendTransactionService {
 }
 
 impl ConfigSendTransactionService {
-    const fn default_service_max_retries() -> usize {
-        usize::MAX
-    }
-
-    const fn default_stop_send_on_commitment() -> CommitmentLevel {
-        CommitmentLevel::Confirmed
-    }
-
     const fn default_leader_forward_count() -> Option<usize> {
         None
-    }
-
-    const fn default_retry_rate() -> Duration {
-        Duration::from_millis(1_000)
     }
 }
 
@@ -463,12 +442,9 @@ pub struct ConfigLewisEvents {
     )]
     pub reconnect_max_interval: Duration,
 
-    /// Maximum time for the entire stream
-    #[serde(
-        default = "ConfigLewisEvents::default_stream_timeout",
-        with = "humantime_serde"
-    )]
-    pub stream_timeout: Duration,
+    #[serde(default)]
+    #[deprecated(note = "This option is deprecated and is ignored")]
+    pub stream_timeout: Option<Duration>,
 }
 
 impl ConfigLewisEvents {
@@ -514,10 +490,6 @@ impl ConfigLewisEvents {
 
     const fn default_reconnect_max_interval() -> Duration {
         Duration::from_secs(30)
-    }
-
-    const fn default_stream_timeout() -> Duration {
-        Duration::from_secs(300) // 0 means no timeout
     }
 }
 
@@ -625,33 +597,77 @@ impl PrometheusConfig {
 mod tests {
     use super::*;
 
+    /// Isolates `ConfigJet::deserialize_http_txn_trace_drain` behind a minimal wrapper instead
+    /// of exercising it through a full `ConfigJet`, which would need every other required field
+    /// filled in just to reach this one.
+    #[derive(Debug, Deserialize)]
+    struct Wrapper {
+        #[serde(
+            default,
+            deserialize_with = "ConfigJet::deserialize_http_txn_trace_drain"
+        )]
+        http_txn_trace_drain: Option<HttpTxnTraceDrainConfig>,
+    }
+
     #[test]
-    fn test_deser_jet_gateway_client() {
-        let yaml = r#"
-        max_streams: null
-        endpoints:
-            - http://127.0.0.1:8002
-        # Access token
-        x_token: null
-        "#;
+    fn http_txn_trace_drain_parses_a_valid_url() {
+        let wrapper: Wrapper = serde_yaml::from_str(
+            r#"
+http_txn_trace_drain:
+  url: http://localhost:8123
+  credentials: null
+"#,
+        )
+        .expect("deserialization should succeed");
 
-        let cfg: ConfigJetGatewayClient = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.endpoints, vec!["http://127.0.0.1:8002"]);
-        assert_eq!(cfg.max_streams, None);
-        assert_eq!(cfg.x_token, None);
+        let drain = wrapper
+            .http_txn_trace_drain
+            .expect("a valid url should deserialize to Some");
+        assert_eq!(drain.url.as_str(), "http://localhost:8123/");
+    }
 
-        // Interpret 0 as None
-        let yaml = r#"
-        max_streams: 0
-        endpoints:
-            - http://127.0.0.1:8002
-        # Access token
-        x_token: null
-        "#;
+    #[test]
+    fn http_txn_trace_drain_becomes_none_on_an_unparseable_url() {
+        let wrapper: Wrapper = serde_yaml::from_str(
+            r#"
+http_txn_trace_drain:
+  url: "not a url"
+  credentials: null
+"#,
+        )
+        .expect("an unparseable url must not fail deserialization of the whole config");
 
-        let cfg: ConfigJetGatewayClient = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.endpoints, vec!["http://127.0.0.1:8002"]);
-        assert_eq!(cfg.max_streams, None);
-        assert_eq!(cfg.x_token, None);
+        assert!(
+            wrapper.http_txn_trace_drain.is_none(),
+            "an unparseable url should downgrade the field to None instead of erroring"
+        );
+    }
+
+    #[test]
+    fn http_txn_trace_drain_defaults_to_none_when_absent() {
+        let wrapper: Wrapper = serde_yaml::from_str("{}").expect("deserialization should succeed");
+        assert!(wrapper.http_txn_trace_drain.is_none());
+    }
+
+    #[test]
+    fn http_txn_trace_drain_becomes_none_on_a_malformed_field_other_than_url() {
+        // `max_ndjson_len` is a `usize`; a string here is a type error unrelated to `url`, and
+        // must still degrade to `None` rather than fail the whole config -- this is what
+        // distinguishes the current (deserialize-anything-leniently) behavior from an earlier
+        // version of this function that only special-cased `url` specifically.
+        let wrapper: Wrapper = serde_yaml::from_str(
+            r#"
+http_txn_trace_drain:
+  url: http://localhost:8123
+  credentials: null
+  max_ndjson_len: "not a number"
+"#,
+        )
+        .expect("a malformed sub-field must not fail deserialization of the whole config");
+
+        assert!(
+            wrapper.http_txn_trace_drain.is_none(),
+            "a malformed field anywhere in http_txn_trace_drain should downgrade it to None"
+        );
     }
 }
