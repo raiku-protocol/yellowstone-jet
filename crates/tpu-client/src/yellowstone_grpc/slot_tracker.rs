@@ -4,7 +4,7 @@ use {
         yellowstone_grpc::subscribe::{AutoReconnectStream, GeyserConnector},
     },
     futures::Stream,
-    std::{collections::HashMap, panic},
+    std::collections::HashMap,
     tokio::task::JoinHandle,
     tokio_stream::StreamExt,
     yellowstone_grpc_client::GeyserGrpcClientResult,
@@ -57,6 +57,11 @@ impl Drop for AutoCloseSlotTracker {
 ///
 /// Background task to update the AtomicSlotTracker from the Yellowstone Geyser slot stream
 ///
+/// A stream error is not fatal: [`AutoReconnectStream`] yields it and then resubscribes
+/// on its own. From the error until the first slot newer than the last one seen, the
+/// tracker reports disconnected, since a send routed off a stale slot would target a
+/// past leader.
+///
 async fn atomic_slot_tracker_loop<S, E>(mut dm_slot_stream: S, to_drop: AutoCloseSlotTracker)
 where
     S: Stream<Item = Result<SubscribeUpdate, E>> + Unpin + Send + 'static,
@@ -74,9 +79,12 @@ where
         let response = match result.unwrap() {
             Ok(response) => response,
             Err(err) => {
-                tracing::error!("Yellowstone slot tracker stream error: {:?}", err);
-                drop(to_drop);
-                panic::panic_any(err);
+                tracing::warn!("Yellowstone slot tracker stream error: {:?}", err);
+                shared
+                    .inner
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                continue;
             }
         };
         match response.update_oneof.expect("update_oneof") {
@@ -92,6 +100,10 @@ where
                     .inner
                     .slot
                     .store(current_slot, std::sync::atomic::Ordering::Relaxed);
+                shared
+                    .inner
+                    .closed
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
             _ => {
                 // Ignore other updates
@@ -256,5 +268,61 @@ mod tests {
                 .closed
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("deployment restart")]
+    struct StreamError;
+
+    fn slot_update(slot: u64) -> Result<SubscribeUpdate, StreamError> {
+        Ok(SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                dead_error: None,
+                parent: None,
+                status: SlotStatus::SlotProcessed as i32,
+            })),
+            filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
+            created_at: None,
+        })
+    }
+
+    /// What [`AutoReconnectStream`] yields when the provider restarts its servers:
+    /// the stream error, then the resubscribed stream's slots. The error used to
+    /// panic the task, which aborts a `panic = "abort"` process.
+    #[tokio::test]
+    async fn test_it_should_survive_a_stream_error() {
+        let slot_tracker = SlotTracker::new(0);
+        let to_drop = AutoCloseSlotTracker {
+            slot_tracker: slot_tracker.clone(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(atomic_slot_tracker_loop(
+            UnboundedReceiverStream::new(rx),
+            to_drop,
+        ));
+        let settle = || tokio::time::sleep(Duration::from_millis(10));
+
+        tx.send(slot_update(10)).expect("send update");
+        tx.send(Err(StreamError)).expect("send error");
+        settle().await;
+        assert!(
+            !handle.is_finished(),
+            "the tracker task must outlive a stream error"
+        );
+        assert!(
+            slot_tracker.load().is_err(),
+            "stale slot must not be served"
+        );
+
+        // The new stream can start at or behind the last slot seen.
+        tx.send(slot_update(9)).expect("send update");
+        tx.send(slot_update(10)).expect("send update");
+        settle().await;
+        assert!(slot_tracker.load().is_err());
+
+        tx.send(slot_update(11)).expect("send update");
+        settle().await;
+        assert_eq!(slot_tracker.load().expect("load"), 11);
     }
 }

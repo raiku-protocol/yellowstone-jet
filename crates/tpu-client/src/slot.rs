@@ -10,10 +10,11 @@ use std::sync::{
 ///
 /// This struct is thread-safe. Shared it using an atomic reference-counter.
 ///
-/// # Poisoning
+/// # Disconnection
 ///
-/// The slot tracker can be poisoned if the background task updating it panics or is dropped.
-///
+/// [`SlotTracker::load`] fails while the slot stream feeding it is down. That is
+/// temporary while the stream reconnects, and permanent once the background task
+/// panics or is dropped.
 ///
 #[derive(Debug, Clone)]
 pub struct SlotTracker {
@@ -51,7 +52,7 @@ impl SlotTracker {
     ///
     /// Load the current slot.
     ///
-    /// Returns an error if the slot tracker is poisoned.
+    /// Returns an error while the slot tracker is disconnected; the slot it last saw is stale then.
     ///
     pub fn load(&self) -> Result<u64, Disconnected> {
         let is_closed = self.inner.closed.load(std::sync::atomic::Ordering::Acquire);
