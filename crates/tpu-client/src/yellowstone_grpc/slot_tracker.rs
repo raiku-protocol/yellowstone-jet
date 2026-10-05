@@ -8,9 +8,12 @@ use {
     tokio::task::JoinHandle,
     tokio_stream::StreamExt,
     yellowstone_grpc_client::GeyserGrpcClientResult,
-    yellowstone_grpc_proto::geyser::{
-        SubscribeRequest, SubscribeRequestFilterSlots, SubscribeUpdate,
-        subscribe_update::UpdateOneof,
+    yellowstone_grpc_proto::{
+        geyser::{
+            SubscribeRequest, SubscribeRequestFilterSlots, SubscribeUpdate,
+            subscribe_update::UpdateOneof,
+        },
+        tonic::Status,
     },
 };
 
@@ -87,30 +90,55 @@ where
                 continue;
             }
         };
-        match response.update_oneof.expect("update_oneof") {
-            UpdateOneof::Slot(subscribe_update_slot) => {
-                let slot = subscribe_update_slot.slot;
-                if slot <= current_slot {
-                    // Ignore out-of-order or duplicate slot updates
-                    continue;
-                }
-                current_slot = slot;
-                tracing::trace!("Yellowstone slot tracker received slot update: {}", slot);
-                shared
-                    .inner
-                    .slot
-                    .store(current_slot, std::sync::atomic::Ordering::Relaxed);
-                shared
-                    .inner
-                    .closed
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
-            _ => {
-                // Ignore other updates
-            }
+        // Ignore other updates, and an update missing its payload rather than
+        // panic on it.
+        let Some(UpdateOneof::Slot(subscribe_update_slot)) = response.update_oneof else {
+            continue;
+        };
+        let slot = subscribe_update_slot.slot;
+        if slot <= current_slot {
+            // Ignore out-of-order or duplicate slot updates
+            continue;
         }
+        current_slot = slot;
+        tracing::trace!("Yellowstone slot tracker received slot update: {}", slot);
+        shared
+            .inner
+            .slot
+            .store(current_slot, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .inner
+            .closed
+            .store(false, std::sync::atomic::Ordering::Release);
     }
     drop(to_drop);
+}
+
+///
+/// Waits for the first slot update to establish the tip.
+///
+/// Returns `Ok(None)` if the stream ends first. Updates other than slots, and updates
+/// missing their payload, are skipped.
+///
+async fn wait_for_initial_slot<S>(stream: &mut S) -> GeyserGrpcClientResult<Option<u64>>
+where
+    S: Stream<Item = Result<SubscribeUpdate, Status>> + Unpin,
+{
+    while let Some(result) = stream.next().await {
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::error!("Yellowstone slot tracker stream error: {:?}", err);
+                return Err(yellowstone_grpc_client::GeyserGrpcClientError::TonicStatus(
+                    err,
+                ));
+            }
+        };
+        if let Some(UpdateOneof::Slot(subscribe_update_slot)) = response.update_oneof {
+            return Ok(Some(subscribe_update_slot.slot));
+        }
+    }
+    Ok(None)
 }
 
 ///
@@ -126,34 +154,9 @@ pub async fn atomic_slot_tracker(
         .subscribe_once(subscribe_request.clone())
         .await?;
 
-    let initial_slot: u64;
-    // wait for the first slot update to establish the tip
-    loop {
-        let Some(result) = stream.next().await else {
-            return Ok(None);
-        };
-
-        let response = match result {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::error!("Yellowstone slot tracker stream error: {:?}", err);
-                return Err(yellowstone_grpc_client::GeyserGrpcClientError::TonicStatus(
-                    err,
-                ));
-            }
-        };
-
-        match response.update_oneof.expect("update_oneof") {
-            UpdateOneof::Slot(subscribe_update_slot) => {
-                initial_slot = subscribe_update_slot.slot;
-                break;
-            }
-            _ => {
-                // Ignore other updates
-                continue;
-            }
-        }
-    }
+    let Some(initial_slot) = wait_for_initial_slot(&mut stream).await? else {
+        return Ok(None);
+    };
 
     let slot_tracker = SlotTracker::new(initial_slot);
 
@@ -324,5 +327,52 @@ mod tests {
         tx.send(slot_update(11)).expect("send update");
         settle().await;
         assert_eq!(slot_tracker.load().expect("load"), 11);
+    }
+
+    fn empty_update<E>() -> Result<SubscribeUpdate, E> {
+        Ok(SubscribeUpdate {
+            update_oneof: None,
+            filters: vec![SLOT_TRACKER_DM_FILTER_NAME.to_string()],
+            created_at: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_it_should_skip_an_update_without_payload() {
+        let slot_tracker = SlotTracker::new(0);
+        let to_drop = AutoCloseSlotTracker {
+            slot_tracker: slot_tracker.clone(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(atomic_slot_tracker_loop(
+            UnboundedReceiverStream::new(rx),
+            to_drop,
+        ));
+
+        tx.send(empty_update()).expect("send update");
+        tx.send(slot_update(5)).expect("send update");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!handle.is_finished());
+        assert_eq!(slot_tracker.load().expect("load"), 5);
+    }
+
+    #[tokio::test]
+    async fn test_initial_slot_skips_an_update_without_payload() {
+        let initial = |slot| {
+            slot_update(slot).map_err(|StreamError| Status::unavailable("deployment restart"))
+        };
+        let mut stream = tokio_stream::iter(vec![empty_update(), initial(7), initial(8)]);
+        assert_eq!(
+            wait_for_initial_slot(&mut stream)
+                .await
+                .expect("initial slot"),
+            Some(7)
+        );
+
+        let mut ended = tokio_stream::iter(vec![empty_update::<Status>()]);
+        assert_eq!(
+            wait_for_initial_slot(&mut ended).await.expect("no error"),
+            None
+        );
     }
 }
