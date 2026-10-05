@@ -1,5 +1,4 @@
 use {
-    crate::txn_trace_drain::HttpTxnTraceDrainConfig,
     anyhow::Context,
     reqwest::Url,
     serde::{
@@ -75,9 +74,6 @@ pub struct ConfigJet {
     /// Quic config
     pub quic: ConfigQuic,
 
-    /// Send events to Lewis
-    pub lewis_events: Option<ConfigLewisEvents>,
-
     #[serde(default = "default_true")]
     pub enable_yellowstone_shield: bool,
 
@@ -89,14 +85,6 @@ pub struct ConfigJet {
     /// This is useful for debugging transaction handling errors, but may cause log spam if there are many invalid transactions.
     #[serde(default)]
     pub log_invalid_txn: bool,
-
-    /// If `url` fails to parse, this is treated as absent (`None`, with a warning logged)
-    /// rather than failing config load entirely -- see `ConfigJet::deserialize_http_txn_trace_drain`.
-    #[serde(
-        default,
-        deserialize_with = "ConfigJet::deserialize_http_txn_trace_drain"
-    )]
-    pub http_txn_trace_drain: Option<HttpTxnTraceDrainConfig>,
 }
 
 const fn default_true() -> bool {
@@ -113,41 +101,6 @@ impl ConfigJet {
                 .map(Some)
                 .map_err(de::Error::custom),
             None => Ok(None),
-        }
-    }
-
-    ///
-    /// Deserializes `http_txn_trace_drain` leniently: if the value present fails to deserialize
-    /// into `HttpTxnTraceDrainConfig` for *any* reason (a bad `url`, a malformed `credentials`
-    /// block, a wrong type, ...), that's treated the same as the field being absent (`None`,
-    /// with a warning logged) instead of failing config load for the whole process.
-    ///
-    /// This has to go through an intermediate, format-native [`serde_yaml::Value`] rather than
-    /// deserializing `HttpTxnTraceDrainConfig` from `deserializer` directly: a `Deserializer` is
-    /// generally single-use (many formats can't rewind and try again), so attempting the real
-    /// type first and falling back on failure isn't an option -- there'd be nothing left to
-    /// deserialize a fallback from. Buffering into a `Value` first (self-describing, freely
-    /// re-deserializable) is what makes "try it, and turn a failure into `None`" possible at all.
-    ///
-    fn deserialize_http_txn_trace_drain<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<HttpTxnTraceDrainConfig>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let Some(value) = Option::<serde_yaml::Value>::deserialize(deserializer)? else {
-            return Ok(None);
-        };
-
-        match HttpTxnTraceDrainConfig::deserialize(value) {
-            Ok(config) => Ok(Some(config)),
-            Err(error) => {
-                tracing::warn!(
-                    "failed to deserialize http_txn_trace_drain ({error}); \
-                     disabling http_txn_trace_drain"
-                );
-                Ok(None)
-            }
         }
     }
 }
@@ -369,132 +322,6 @@ impl ConfigQuic {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigLewisEvents {
-    /// gRPC endpoint for Lewis event service
-    pub endpoint: String,
-
-    /// Optional X-Token for authentication
-    pub x_token: Option<String>,
-
-    /// Events gRPC queue size
-    #[serde(default = "ConfigLewisEvents::default_queue_size_grpc")]
-    pub queue_size_grpc: usize,
-
-    /// Jet ID to use for events
-    #[serde(default)]
-    pub jet_id: Option<String>,
-
-    /// Batch size threshold - number of events before forcing a flush
-    #[serde(default = "ConfigLewisEvents::default_batch_size_threshold")]
-    pub batch_size_threshold: u64,
-
-    /// Batch timeout - max time to wait before flushing events
-    #[serde(
-        default = "ConfigLewisEvents::default_batch_timeout",
-        with = "humantime_serde"
-    )]
-    pub batch_timeout: Duration,
-
-    /// Connection timeout for Lewis gRPC
-    #[serde(
-        default = "ConfigLewisEvents::default_connect_timeout",
-        with = "humantime_serde"
-    )]
-    pub connect_timeout: Duration,
-
-    /// HTTP2 keepalive interval
-    #[serde(
-        default = "ConfigLewisEvents::default_keepalive_interval",
-        with = "humantime_serde"
-    )]
-    pub keepalive_interval: Duration,
-
-    /// Keepalive timeout
-    #[serde(
-        default = "ConfigLewisEvents::default_keepalive_timeout",
-        with = "humantime_serde"
-    )]
-    pub keepalive_timeout: Duration,
-
-    /// Size of internal event buffer between handler and client
-    #[serde(default = "ConfigLewisEvents::default_event_buffer_size")]
-    pub event_buffer_size: usize,
-
-    /// Keep HTTP2 connection alive even when idle
-    #[serde(default = "ConfigLewisEvents::default_keep_alive_while_idle")]
-    pub keep_alive_while_idle: bool,
-
-    /// Maximum number of reconnection attempts
-    #[serde(default = "ConfigLewisEvents::default_max_reconnect_attempts")]
-    pub max_reconnect_attempts: usize,
-
-    /// Initial interval for reconnection backoff
-    #[serde(
-        default = "ConfigLewisEvents::default_reconnect_initial_interval",
-        with = "humantime_serde"
-    )]
-    pub reconnect_initial_interval: Duration,
-
-    /// Maximum interval for reconnection backoff
-    #[serde(
-        default = "ConfigLewisEvents::default_reconnect_max_interval",
-        with = "humantime_serde"
-    )]
-    pub reconnect_max_interval: Duration,
-
-    #[serde(default)]
-    #[deprecated(note = "This option is deprecated and is ignored")]
-    pub stream_timeout: Option<Duration>,
-}
-
-impl ConfigLewisEvents {
-    const fn default_queue_size_grpc() -> usize {
-        10_000
-    }
-
-    const fn default_batch_size_threshold() -> u64 {
-        512
-    }
-
-    const fn default_batch_timeout() -> Duration {
-        Duration::from_millis(1000)
-    }
-
-    const fn default_connect_timeout() -> Duration {
-        Duration::from_secs(10)
-    }
-
-    const fn default_keepalive_interval() -> Duration {
-        Duration::from_secs(30)
-    }
-
-    const fn default_keepalive_timeout() -> Duration {
-        Duration::from_secs(10)
-    }
-
-    const fn default_event_buffer_size() -> usize {
-        100_000
-    }
-
-    const fn default_keep_alive_while_idle() -> bool {
-        true
-    }
-
-    const fn default_max_reconnect_attempts() -> usize {
-        3
-    }
-
-    const fn default_reconnect_initial_interval() -> Duration {
-        Duration::from_millis(1000)
-    }
-
-    const fn default_reconnect_max_interval() -> Duration {
-        Duration::from_secs(30)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConfigListenGrpc {
     /// gRPC listen address
     #[serde(deserialize_with = "deserialize_listen")]
@@ -590,84 +417,5 @@ pub struct PrometheusConfig {
 impl PrometheusConfig {
     const fn default_push_interval() -> Duration {
         Duration::from_secs(10)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Isolates `ConfigJet::deserialize_http_txn_trace_drain` behind a minimal wrapper instead
-    /// of exercising it through a full `ConfigJet`, which would need every other required field
-    /// filled in just to reach this one.
-    #[derive(Debug, Deserialize)]
-    struct Wrapper {
-        #[serde(
-            default,
-            deserialize_with = "ConfigJet::deserialize_http_txn_trace_drain"
-        )]
-        http_txn_trace_drain: Option<HttpTxnTraceDrainConfig>,
-    }
-
-    #[test]
-    fn http_txn_trace_drain_parses_a_valid_url() {
-        let wrapper: Wrapper = serde_yaml::from_str(
-            r#"
-http_txn_trace_drain:
-  url: http://localhost:8123
-  credentials: null
-"#,
-        )
-        .expect("deserialization should succeed");
-
-        let drain = wrapper
-            .http_txn_trace_drain
-            .expect("a valid url should deserialize to Some");
-        assert_eq!(drain.url.as_str(), "http://localhost:8123/");
-    }
-
-    #[test]
-    fn http_txn_trace_drain_becomes_none_on_an_unparseable_url() {
-        let wrapper: Wrapper = serde_yaml::from_str(
-            r#"
-http_txn_trace_drain:
-  url: "not a url"
-  credentials: null
-"#,
-        )
-        .expect("an unparseable url must not fail deserialization of the whole config");
-
-        assert!(
-            wrapper.http_txn_trace_drain.is_none(),
-            "an unparseable url should downgrade the field to None instead of erroring"
-        );
-    }
-
-    #[test]
-    fn http_txn_trace_drain_defaults_to_none_when_absent() {
-        let wrapper: Wrapper = serde_yaml::from_str("{}").expect("deserialization should succeed");
-        assert!(wrapper.http_txn_trace_drain.is_none());
-    }
-
-    #[test]
-    fn http_txn_trace_drain_becomes_none_on_a_malformed_field_other_than_url() {
-        // `max_ndjson_len` is a `usize`; a string here is a type error unrelated to `url`, and
-        // must still degrade to `None` rather than fail the whole config -- this is what
-        // distinguishes the current (deserialize-anything-leniently) behavior from an earlier
-        // version of this function that only special-cased `url` specifically.
-        let wrapper: Wrapper = serde_yaml::from_str(
-            r#"
-http_txn_trace_drain:
-  url: http://localhost:8123
-  credentials: null
-  max_ndjson_len: "not a number"
-"#,
-        )
-        .expect("a malformed sub-field must not fail deserialization of the whole config");
-
-        assert!(
-            wrapper.http_txn_trace_drain.is_none(),
-            "a malformed field anywhere in http_txn_trace_drain should downgrade it to None"
-        );
     }
 }

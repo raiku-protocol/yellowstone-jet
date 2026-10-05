@@ -45,8 +45,6 @@ libc = { workspace = true }
 maplit = { workspace = true }
 pin-project = { workspace = true }
 prometheus = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 rand = { workspace = true }
@@ -65,7 +63,6 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true, features = ["tls-native-roots"] }
 tonic-health = { workspace = true }
-tonic-prost = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "json"] }
@@ -116,9 +113,6 @@ yellowstone-shield-store = { workspace = true }
 anyhow = { workspace = true }
 cargo-lock = { workspace = true }
 git-version = { workspace = true }
-protobuf-src = { workspace = true }
-tonic-build = { workspace = true }
-tonic-prost-build = { workspace = true }
 vergen = { workspace = true, features = ["build", "rustc"] }
 
 [lints]

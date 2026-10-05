@@ -3,7 +3,6 @@ use tikv_jemallocator::Jemalloc;
 use {
     anyhow::Context,
     clap::{Parser, Subcommand},
-    futures::FutureExt,
     jsonrpsee::http_client::HttpClientBuilder,
     solana_client::rpc_client::RpcClientConfig,
     solana_commitment_config::CommitmentConfig,
@@ -28,15 +27,14 @@ use {
         sync::mpsc,
         task::{self, JoinSet},
     },
-    tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream},
+    tokio_stream::wrappers::ReceiverStream,
     tokio_util::sync::CancellationToken,
-    tracing::{error, info, warn},
+    tracing::{info, warn},
     yellowstone_jet::{
         blockhash_queue::BlockhashQueue,
         cluster_tpu_info::ClusterTpuInfo,
         config::{ConfigJet, RpcErrorStrategy, load_config},
         grpc_geyser::{GeyserStreams, GeyserSubscriber},
-        grpc_lewis::create_lewis_pipeline,
         metrics::{REGISTRY, jet as metrics},
         rpc::{
             admin::{AdminServer, RpcClient, TpuActivityTracker},
@@ -50,7 +48,6 @@ use {
             DropExpiredTransactions, FanoutConfig, SendTransactionRequest, TransactionFanout,
             TransactionPolicyStore,
         },
-        txn_trace_drain::HttpTxnTraceDrain,
         util::WaitShutdown,
     },
     yellowstone_jet_tpu_client::{
@@ -235,15 +232,11 @@ async fn keep_stake_metrics_up_to_date_task(
 }
 
 #[derive(Clone)]
-struct JetTpuCallback<Other> {
+struct JetTpuCallback {
     tpu_activity_tracker: Arc<TpuActivityTracker>,
-    other: Other,
 }
 
-impl<Other> TpuSenderResponseCallback for JetTpuCallback<Other>
-where
-    Other: TpuSenderResponseCallback,
-{
+impl TpuSenderResponseCallback for JetTpuCallback {
     fn call(&self, response: yellowstone_jet_tpu_client::core::TpuSenderResponse) {
         match &response {
             TpuSenderResponse::TxSent(_) => {
@@ -270,8 +263,6 @@ where
                     .increment_by(Instant::now(), 1);
             }
         }
-
-        self.other.call(response)
     }
 }
 
@@ -386,51 +377,9 @@ async fn run_jet(
         Arc::new(IgnorantLeaderPredictor)
     };
 
-    // Set up Lewis event tracking pipeline
-    let maybe_callback_sink = match (config.http_txn_trace_drain, config.lewis_events) {
-        (None, None) => None,
-        (None, Some(lewis_config)) => {
-            let (tpu_client_callback_tx, tpu_client_callback_rx) =
-                tokio::sync::mpsc::unbounded_channel();
-            let tpu_client_callback_rx = UnboundedReceiverStream::new(tpu_client_callback_rx);
-            let lewis_fut = create_lewis_pipeline(lewis_config, tpu_client_callback_rx);
-            let ah = tg.spawn(
-                lewis_fut
-                    .inspect(|result| {
-                        if let Err(e) = result {
-                            error!("Lewis client error: {e}");
-                        }
-                    })
-                    .map(drop),
-            );
-            tg_name_map.insert(ah.id(), "lewis_client".to_string());
-            Some(tpu_client_callback_tx)
-        }
-        (Some(http_txn_drain_config), None) => {
-            let (tpu_client_callback_tx, tpu_client_callback_rx) =
-                tokio::sync::mpsc::unbounded_channel();
-            let drain = HttpTxnTraceDrain::with_config(
-                UnboundedReceiverStream::new(tpu_client_callback_rx),
-                cluster_tpu_info.clone(),
-                http_txn_drain_config,
-            );
-            let ah = tg.spawn(async move {
-                let _ = drain.await.inspect_err(|e| {
-                    error!("HTTP txn trace drain error: {e}");
-                });
-            });
-            tg_name_map.insert(ah.id(), "http_txn_trace_drain".to_string());
-            Some(tpu_client_callback_tx)
-        }
-        (Some(_), Some(_)) => {
-            panic!("http_txn_trace_drain and lewis_events cannot be used together")
-        }
-    };
-
     let shared_tpu_activity_tracker = Arc::new(TpuActivityTracker::default());
     let jet_callback = JetTpuCallback {
         tpu_activity_tracker: Arc::clone(&shared_tpu_activity_tracker),
-        other: maybe_callback_sink,
     };
 
     let tpu_sender = create_base_tpu_client(

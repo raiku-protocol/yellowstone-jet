@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "apps/jet", # 14.9.2
-    "apps/jet-txn-landing-elt", # 0.1.0
     "crates/tpu-client", # 0.3.0
 ]
 exclude = [
@@ -45,9 +44,6 @@ libc = "0.2.177"
 maplit = "1.0.2"
 pin-project = "1.1.5"
 prometheus = "0.14.0"
-prost = "0.14.0"
-prost-types = "0.14.0"
-protobuf-src = "1.1.0"
 quinn = "0.11.6"
 quinn-proto = "0.11.6"
 rand = "0.9.2"
@@ -65,10 +61,7 @@ tokio = "1.48.0"
 tokio-stream = "0.1.15"
 tokio-util = "0.7.16"
 tonic = "0.14.0"
-tonic-build = "0.14.0"
 tonic-health = "0.14.0"
-tonic-prost = "0.14.0"
-tonic-prost-build = "0.14.0"
 tower = "0.5.0"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.1"
@@ -113,7 +106,6 @@ solana-transaction-error = "3.0.0"
 wincode = "0.5.5"
 
 # Yellowstone
-yellowstone-fumarole-client = "0.7.1"
 yellowstone-grpc-client = "13.1.0"
 yellowstone-grpc-proto = "12.5.0"
 yellowstone-jet-tpu-client = { path = "crates/tpu-client", version = "0.8.0", default-features = false }

@@ -17,6 +17,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 - Removed `proxy_preflight_check`. Transactions with `skip_preflight: false` are now rejected with an error.
 - `TransactionHandler` no longer needs an RPC client.
 - Proto field `TransactionConfig.skip_sanitize` (field 2) is now reserved.
+- Removed Triton-only integrations from the `jet` app: Lewis event reporting (`lewis_events`, `lewis-dummy-server`) and the HTTP transaction-trace drain (`http_txn_trace_drain`, `txn-trace-generator`). Configs that still set either key now fail to load.
+- Removed the `jet-txn-landing-elt` app (ClickHouse sink and purge runner) with its ClickHouse schemas and docker-compose setup, and rpcpool's GoReleaser release config.
 
 ### Fixes
 
