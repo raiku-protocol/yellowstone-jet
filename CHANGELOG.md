@@ -22,6 +22,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Fixes
 
+- tpu-client: a slot-stream error no longer panics the Yellowstone slot tracker. `AutoReconnectStream` yields the error before it resubscribes, and the tracker used to `panic_any` on it, which aborts a `panic = "abort"` process, for example when the gRPC provider restarts its servers. The tracker now reports disconnected from the error until the first slot newer than the last one it saw, so sends fail with `SlotTrackerDisconnected` instead of going to a past leader. A slot update without its payload (`update_oneof`) is skipped, at startup and after, instead of panicking.
+- tpu-client: upcoming-leader prediction returns no leaders while the slot tracker is disconnected. It used to panic.
 - tpu-client: upcoming-leader prediction runs on its own timer. It used to run only when a transaction or a connection event woke the driver, so a sender with no traffic re-predicted only when an idle worker shut down, about every 10s, and never pre-connected to some upcoming leaders.
 
 ## [14.9.1]
