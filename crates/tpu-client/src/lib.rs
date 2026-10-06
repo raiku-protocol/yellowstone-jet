@@ -42,11 +42,15 @@
 //!
 //! Compile-time capacity tuning:
 //!
-//! - Set `TXN_INFO_CAP` before build to change metadata storage capacity.
-//! - Default capacity is `64` bytes.
+//! - Pick the capacity with a `txn-info-cap-*` feature: `0`, `64` (the default), `128` or `192`.
+//! - For any other size, enable `txn-info-cap-custom` and set `TXN_INFO_CAP` (`64` if unset).
+//!   `build.rs` ignores `TXN_INFO_CAP` without that feature.
+//! - If several tiers end up enabled (Cargo unifies features across dependents), the largest wins,
+//!   so turn off default features to drop the default `txn-info-cap-64`.
 //!
 //! ```sh
-//! TXN_INFO_CAP=128 cargo build -p yellowstone-jet-tpu-client
+//! TXN_INFO_CAP=100 cargo build -p yellowstone-jet-tpu-client \
+//!     --no-default-features --features yellowstone-grpc,simd-0296,txn-info-cap-custom
 //! ```
 //!
 //! You can inspect the value at runtime:

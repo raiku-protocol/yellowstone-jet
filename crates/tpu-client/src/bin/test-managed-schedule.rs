@@ -106,13 +106,15 @@ async fn main() {
             .await
             .expect("spawn_managed_leader_schedule");
 
-    let atomic_slot_tracker =
-        yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::atomic_slot_tracker(
-            geyser_client,
-        )
-        .await
-        .expect("atomic_slot_tracker")
-        .expect("some");
+    let yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::YellowstoneSlotTrackerOk {
+        atomic_slot_tracker,
+        join_handle: _slot_tracker_jh,
+    } = yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::atomic_slot_tracker(
+        geyser_client,
+    )
+    .await
+    .expect("atomic_slot_tracker")
+    .expect("some");
 
     let mut ctrlc = tokio::spawn(tokio::signal::ctrl_c());
 

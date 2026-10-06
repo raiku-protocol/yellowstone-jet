@@ -4,7 +4,7 @@ use {
         yellowstone_grpc::subscribe::{AutoReconnectStream, GeyserConnector},
     },
     futures::Stream,
-    std::{collections::HashMap, panic, sync::Arc},
+    std::{collections::HashMap, panic},
     tokio::task::JoinHandle,
     tokio_stream::StreamExt,
     yellowstone_grpc_client::GeyserGrpcClientResult,
@@ -16,8 +16,15 @@ use {
 
 pub(crate) const SLOT_TRACKER_DM_FILTER_NAME: &str = "jet-tpu-client";
 
+///
+/// A running slot tracker: the tracker plus the background task that feeds it.
+///
+/// The task resubscribes on its own and does not stop when every [`SlotTracker`] clone is
+/// dropped. Abort `join_handle` to stop it and close its gRPC subscription; dropping the handle
+/// only detaches the task.
+///
 pub struct YellowstoneSlotTrackerOk {
-    pub atomic_slot_tracker: Arc<SlotTracker>,
+    pub atomic_slot_tracker: SlotTracker,
     pub join_handle: JoinHandle<()>,
 }
 
@@ -95,11 +102,12 @@ where
 }
 
 ///
-/// Creates an [`AtomicSlotTracker`] that tracks the latest slot from Yellowstone Geyser.
+/// Creates a [`SlotTracker`] that tracks the latest slot from Yellowstone Geyser, and the
+/// background task feeding it. See [`YellowstoneSlotTrackerOk`] for stopping that task.
 ///
 pub async fn atomic_slot_tracker(
     mut geyser_client: yellowstone_grpc_client::GeyserGrpcClient,
-) -> GeyserGrpcClientResult<Option<SlotTracker>> {
+) -> GeyserGrpcClientResult<Option<YellowstoneSlotTrackerOk>> {
     let subscribe_request = get_yellowstone_slot_tracker_subscribe_request();
 
     let mut stream = geyser_client
@@ -146,9 +154,12 @@ pub async fn atomic_slot_tracker(
         request: subscribe_request,
     };
     let auto = AutoReconnectStream::new(geyser_connector, stream);
-    tokio::spawn(atomic_slot_tracker_loop(auto, to_drop));
+    let join_handle = tokio::spawn(atomic_slot_tracker_loop(auto, to_drop));
 
-    Ok(Some(slot_tracker))
+    Ok(Some(YellowstoneSlotTrackerOk {
+        atomic_slot_tracker: slot_tracker,
+        join_handle,
+    }))
 }
 
 #[cfg(test)]

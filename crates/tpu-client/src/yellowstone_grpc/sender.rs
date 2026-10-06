@@ -1480,7 +1480,10 @@ where
 
     tracing::debug!("spawned stake info service");
 
-    let atomic_slot_tracker = slot_tracker::atomic_slot_tracker(grpc_client)
+    let slot_tracker::YellowstoneSlotTrackerOk {
+        atomic_slot_tracker,
+        join_handle: slot_tracker_jh,
+    } = slot_tracker::atomic_slot_tracker(grpc_client)
         .await?
         .ok_or(CreateTpuSenderError::GeyserSubscriptionEnded)?;
 
@@ -1528,11 +1531,13 @@ where
         tpu_info_service_jh,
         managed_leader_schedule_jh,
         stake_info_jh,
+        slot_tracker_jh,
     ];
     let handle_name_vec = vec![
         "tpu-info-service",
         "managed-leader-schedule",
         "stake-info-service",
+        "slot-tracker",
     ];
 
     Ok(NewYellowstoneTpuSender {

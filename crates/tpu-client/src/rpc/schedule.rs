@@ -9,7 +9,7 @@ use {
         sync::{Arc, RwLock, atomic::AtomicBool},
     },
     tokio::task::JoinHandle,
-    tokio_util::sync::CancellationToken,
+    tokio_util::sync::{CancellationToken, DropGuard},
 };
 
 pub const DEFAULT_AUTO_LEADER_SCHEDULE_CHECK_INTERVAL: std::time::Duration =
@@ -147,16 +147,9 @@ struct InnerManagedLeaderSchedule {
 #[derive(Clone)]
 pub struct ManagedLeaderSchedule {
     inner: Arc<RwLock<InnerManagedLeaderSchedule>>,
-    shutdown: CancellationToken,
-}
-
-impl Drop for ManagedLeaderSchedule {
-    fn drop(&mut self) {
-        // Stop the background update loop when the last schedule handle is dropped.
-        if Arc::strong_count(&self.inner) == 1 {
-            self.shutdown.cancel();
-        }
-    }
+    /// Shared only by the public handles, so the last handle's drop cancels the background update
+    /// loop. `inner` can't tell: the loop holds its own clone of it.
+    _cancel_on_last_drop: Arc<DropGuard>,
 }
 
 ///
@@ -167,6 +160,16 @@ impl Drop for ManagedLeaderSchedule {
 pub struct GetLeaderError;
 
 impl ManagedLeaderSchedule {
+    fn from_parts(
+        inner: Arc<RwLock<InnerManagedLeaderSchedule>>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            _cancel_on_last_drop: Arc::new(shutdown.drop_guard()),
+        }
+    }
+
     ///
     /// Get the leader for a given slot.
     ///
@@ -206,17 +209,26 @@ impl ManagedLeaderSchedule {
     ///
     #[cfg(any(test, feature = "intg-testing"))]
     pub fn new_for_test(first_slot: u64, schedule: Vec<Pubkey>) -> Self {
+        Self::new_for_test_with_shutdown(first_slot, schedule, CancellationToken::new())
+    }
+
+    #[cfg(any(test, feature = "intg-testing"))]
+    fn new_for_test_with_shutdown(
+        first_slot: u64,
+        schedule: Vec<Pubkey>,
+        shutdown: CancellationToken,
+    ) -> Self {
         let compact = CompactSortedSchedule {
             first_slot,
             schedule,
         };
-        Self {
-            inner: Arc::new(RwLock::new(InnerManagedLeaderSchedule {
+        Self::from_parts(
+            Arc::new(RwLock::new(InnerManagedLeaderSchedule {
                 double_buffer: [compact.clone(), compact],
                 fail: AtomicBool::new(false),
             })),
-            shutdown: CancellationToken::new(),
-        }
+            shutdown,
+        )
     }
 }
 
@@ -387,10 +399,7 @@ pub async fn spawn_managed_leader_schedule(
     });
 
     Ok((
-        ManagedLeaderSchedule {
-            inner: shared,
-            shutdown: cancellation_token,
-        },
+        ManagedLeaderSchedule::from_parts(shared, cancellation_token),
         jh,
     ))
 }
@@ -402,12 +411,17 @@ mod tests {
         solana_clock::DEFAULT_SLOTS_PER_EPOCH,
         solana_pubkey::Pubkey,
         std::collections::BTreeMap,
+        tokio_util::sync::CancellationToken,
     };
 
     #[test]
     fn drop_of_non_last_clone_does_not_cancel_shutdown() {
-        let schedule = super::ManagedLeaderSchedule::new_for_test(0, vec![Pubkey::new_unique()]);
-        let shutdown = schedule.shutdown.clone();
+        let shutdown = CancellationToken::new();
+        let schedule = super::ManagedLeaderSchedule::new_for_test_with_shutdown(
+            0,
+            vec![Pubkey::new_unique()],
+            shutdown.clone(),
+        );
         let schedule2 = schedule.clone();
 
         drop(schedule);
@@ -424,9 +438,31 @@ mod tests {
     }
 
     #[test]
+    fn drop_of_last_handle_cancels_shutdown_while_update_loop_holds_state() {
+        let shutdown = CancellationToken::new();
+        let schedule = super::ManagedLeaderSchedule::new_for_test_with_shutdown(
+            0,
+            vec![Pubkey::new_unique()],
+            shutdown.clone(),
+        );
+        // What `spawn_managed_leader_schedule` hands its update loop.
+        let _update_loop_state = std::sync::Arc::clone(&schedule.inner);
+
+        drop(schedule);
+        assert!(
+            shutdown.is_cancelled(),
+            "the loop's own clone of the state must not keep it running"
+        );
+    }
+
+    #[test]
     fn drop_of_last_instance_cancels_shutdown() {
-        let schedule = super::ManagedLeaderSchedule::new_for_test(0, vec![Pubkey::new_unique()]);
-        let shutdown = schedule.shutdown.clone();
+        let shutdown = CancellationToken::new();
+        let schedule = super::ManagedLeaderSchedule::new_for_test_with_shutdown(
+            0,
+            vec![Pubkey::new_unique()],
+            shutdown.clone(),
+        );
 
         drop(schedule);
         assert!(shutdown.is_cancelled(), "last drop must cancel shutdown");

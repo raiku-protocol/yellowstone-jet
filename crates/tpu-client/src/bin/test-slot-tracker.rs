@@ -77,13 +77,15 @@ async fn main() {
         .await
         .expect("connect");
 
-    let atomic_slot_tracker =
-        yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::atomic_slot_tracker(
-            geyser_client,
-        )
-        .await
-        .expect("atomic_slot_tracker")
-        .expect("Some");
+    let yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::YellowstoneSlotTrackerOk {
+        atomic_slot_tracker,
+        join_handle: _slot_tracker_jh,
+    } = yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::atomic_slot_tracker(
+        geyser_client,
+    )
+    .await
+    .expect("atomic_slot_tracker")
+    .expect("Some");
     let mut ctrlc = tokio::spawn(tokio::signal::ctrl_c());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));

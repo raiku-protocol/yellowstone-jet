@@ -391,6 +391,27 @@ pub struct HardenedKeypair {
 
 impl HardenedKeypair {
     ///
+    /// An all-zero keypair whose secret buffer is mlocked before anything is written into it.
+    /// Callers fill it in place, so the secret is never in unlocked memory, and dropping it on an
+    /// error path zeroizes whatever was written so far.
+    ///
+    fn locked_zeroed() -> Self {
+        let mlocked_private_bytes = Box::new([0u8; 32]);
+        let _lock = region::lock(mlocked_private_bytes.as_ptr(), 32)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    "failed to mlock keypair private key: {error}; secret may be swapped to disk"
+                );
+            })
+            .ok();
+        Self {
+            public_bytes: [0u8; 32],
+            mlocked_private_bytes,
+            _lock,
+        }
+    }
+
+    ///
     /// Reads a JSON-encoded keypair (`[n0,...,n63]`: 32 secret bytes then 32 public bytes) from
     /// `reader`, without ever copying the secret into memory that isn't mlocked.
     ///
@@ -428,15 +449,9 @@ impl HardenedKeypair {
         #[allow(clippy::arithmetic_side_effects)]
         let contents = &trimmed[1..trimmed.len() - 1];
 
-        let mut public_bytes = [0u8; 32];
-        let mut mlocked_private_bytes = Box::new([0u8; 32]);
-        let _lock = region::lock(mlocked_private_bytes.as_ptr(), 32)
-            .inspect_err(|error| {
-                tracing::warn!(
-                    "failed to mlock keypair private key: {error}; secret may be swapped to disk"
-                );
-            })
-            .ok();
+        // Built before any secret byte is parsed, so every early return below drops it through
+        // `HardenedKeypair`'s `Drop`, which zeroizes the partially written secret before unlocking.
+        let mut keypair = Self::locked_zeroed();
 
         let mut count = 0usize;
         for part in contents.split(',') {
@@ -451,9 +466,9 @@ impl HardenedKeypair {
                 .parse()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid byte value"))?;
             if count < 32 {
-                mlocked_private_bytes[count] = byte;
+                keypair.mlocked_private_bytes[count] = byte;
             } else {
-                public_bytes[count - 32] = byte;
+                keypair.public_bytes[count - 32] = byte;
             }
             count += 1;
         }
@@ -468,11 +483,7 @@ impl HardenedKeypair {
         // needed -- wipe it now rather than waiting for `_file_lock`'s buffer to be dropped.
         file_buf.zeroize();
 
-        Ok(Self {
-            public_bytes,
-            mlocked_private_bytes,
-            _lock,
-        })
+        Ok(keypair)
     }
 
     ///
@@ -497,38 +508,23 @@ impl HardenedKeypair {
     }
 
     pub fn insecure_clone(&self) -> HardenedKeypair {
-        let mut private_copy = Box::new([0u8; 32]);
-        let lock = region::lock(private_copy.as_ptr(), 32)
-            .inspect_err(|error| {
-                tracing::warn!(
-                    "failed to mlock cloned keypair private key: {error}; secret may be swapped to disk"
-                );
-            })
-            .ok();
-        // write the private key bytes into the newly allocated, mlocked buffer
-        private_copy[..32].copy_from_slice(self.mlocked_private_bytes.as_slice());
-        HardenedKeypair {
-            public_bytes: self.public_bytes,
-            mlocked_private_bytes: private_copy,
-            _lock: lock,
-        }
+        let mut clone = Self::locked_zeroed();
+        clone.public_bytes = self.public_bytes;
+        clone
+            .mlocked_private_bytes
+            .copy_from_slice(self.mlocked_private_bytes.as_slice());
+        clone
     }
 
     pub fn from_keypair(keypair: &Keypair) -> Self {
-        let mut private_copy = Box::new([0u8; 32]);
-        private_copy[..32].copy_from_slice(&keypair.to_bytes()[..32]);
-        let lock = region::lock(private_copy.as_ptr(), 32)
-            .inspect_err(|error| {
-                tracing::warn!(
-                    "failed to mlock keypair private key: {error}; secret may be swapped to disk"
-                );
-            })
-            .ok();
-        Self {
-            public_bytes: keypair.pubkey().to_bytes(),
-            mlocked_private_bytes: private_copy,
-            _lock: lock,
-        }
+        // Lock first, then copy. `secret_bytes` borrows the secret in place, where `to_bytes`
+        // would leave an unlocked 64-byte copy on the stack.
+        let mut hardened = Self::locked_zeroed();
+        hardened.public_bytes = keypair.pubkey().to_bytes();
+        hardened
+            .mlocked_private_bytes
+            .copy_from_slice(keypair.secret_bytes());
+        hardened
     }
 
     pub fn new() -> Self {
@@ -570,29 +566,24 @@ impl TryFrom<&[u8]> for HardenedKeypair {
         // building a `SigningKey` from raw keypair bytes. `signing_key` is a transient copy of
         // the secret (it has its own `ZeroizeOnDrop`), so it doesn't leave a second unlocked
         // copy behind once we're done with it below.
-        let signing_key = ed25519_dalek::SigningKey::from_keypair_bytes(&data)?;
-        let public_bytes = signing_key.verifying_key().to_bytes();
+        let signing_key = match ed25519_dalek::SigningKey::from_keypair_bytes(&data) {
+            Ok(signing_key) => signing_key,
+            Err(error) => {
+                // `data` holds the rejected secret; wipe it before `_data_lock` unlocks it.
+                data.zeroize();
+                return Err(error);
+            }
+        };
+        let mut keypair = Self::locked_zeroed();
+        keypair.public_bytes = signing_key.verifying_key().to_bytes();
         drop(signing_key);
-
-        let mut mlocked_private_bytes = Box::new([0u8; 32]);
-        let _lock = region::lock(mlocked_private_bytes.as_ptr(), 32)
-            .inspect_err(|error| {
-                tracing::warn!(
-                    "failed to mlock keypair private key: {error}; secret may be swapped to disk"
-                );
-            })
-            .ok();
-        mlocked_private_bytes.copy_from_slice(&data[..32]);
+        keypair.mlocked_private_bytes.copy_from_slice(&data[..32]);
 
         // The scratch copy of the secret is no longer needed -- wipe it now rather than waiting
         // for `_data_lock`'s buffer to be dropped.
         data.zeroize();
 
-        Ok(Self {
-            public_bytes,
-            mlocked_private_bytes,
-            _lock,
-        })
+        Ok(keypair)
     }
 }
 

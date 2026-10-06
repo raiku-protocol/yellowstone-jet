@@ -38,14 +38,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let input = read_input(args.input)?;
     let normalized = normalize_input(&input)?;
-    let (encoding, bytes) = decode_input(&normalized, args.encoding)?;
-
-    let tx: VersionedTransaction = wincode::deserialize(&bytes).with_context(|| {
-        format!(
-            "failed to deserialize {} bytes as VersionedTransaction",
-            bytes.len()
-        )
-    })?;
+    let (encoding, bytes, tx) = decode_input(&normalized, args.encoding)?;
 
     print_summary(encoding, &bytes, &tx, args.detailed);
     Ok(())
@@ -84,32 +77,53 @@ fn normalize_input(input: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn decode_input(input: &str, encoding: Encoding) -> Result<(&'static str, Vec<u8>)> {
+fn decode_input(
+    input: &str,
+    encoding: Encoding,
+) -> Result<(&'static str, Vec<u8>, VersionedTransaction)> {
     match encoding {
-        Encoding::Base64 => Ok((
-            "base64",
-            BASE64_STANDARD
+        Encoding::Base64 => {
+            let bytes = BASE64_STANDARD
                 .decode(input)
-                .with_context(|| "base64 decode failed")?,
-        )),
-        Encoding::Base58 => Ok((
-            "base58",
-            bs58::decode(input)
+                .with_context(|| "base64 decode failed")?;
+            let tx = deserialize_tx(&bytes)?;
+            Ok(("base64", bytes, tx))
+        }
+        Encoding::Base58 => {
+            let bytes = bs58::decode(input)
                 .into_vec()
-                .with_context(|| "base58 decode failed")?,
-        )),
+                .with_context(|| "base58 decode failed")?;
+            let tx = deserialize_tx(&bytes)?;
+            Ok(("base58", bytes, tx))
+        }
         Encoding::Auto => {
-            if let Ok(decoded) = BASE64_STANDARD.decode(input) {
-                return Ok(("base64", decoded));
+            // The base58 alphabet is almost a subset of base64's, so a base58 string whose length
+            // is a multiple of four also decodes as base64, into garbage. Pick the candidate that
+            // deserializes as a transaction rather than the first one that decodes.
+            if let Ok(bytes) = BASE64_STANDARD.decode(input) {
+                if let Ok(tx) = deserialize_tx(&bytes) {
+                    return Ok(("base64", bytes, tx));
+                }
             }
 
-            if let Ok(decoded) = bs58::decode(input).into_vec() {
-                return Ok(("base58", decoded));
+            if let Ok(bytes) = bs58::decode(input).into_vec() {
+                if let Ok(tx) = deserialize_tx(&bytes) {
+                    return Ok(("base58", bytes, tx));
+                }
             }
 
-            bail!("failed to decode input as base64 or base58")
+            bail!("input is not a base64 or base58 encoded VersionedTransaction")
         }
     }
+}
+
+fn deserialize_tx(bytes: &[u8]) -> Result<VersionedTransaction> {
+    wincode::deserialize(bytes).with_context(|| {
+        format!(
+            "failed to deserialize {} bytes as VersionedTransaction",
+            bytes.len()
+        )
+    })
 }
 
 fn print_summary(encoding: &str, bytes: &[u8], tx: &VersionedTransaction, detailed: bool) {
@@ -259,5 +273,54 @@ fn print_detailed_transaction(tx: &VersionedTransaction) {
             }
             println!("address_table_lookups: none (v1 message)");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        solana_instruction::Instruction,
+        solana_keypair::Keypair,
+        solana_message::{Message, VersionedMessage},
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+    };
+
+    /// A signed transaction whose base58 encoding is also valid base64: only base58 characters,
+    /// and a length that is a multiple of four. Instruction data of varying length moves the
+    /// encoded length until it lands on one.
+    fn base58_tx_with_base64_shaped_encoding() -> (VersionedTransaction, String) {
+        let payer = Keypair::new();
+        for data_len in 0..64 {
+            let ix = Instruction::new_with_bytes(Pubkey::new_unique(), &vec![7; data_len], vec![]);
+            let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&payer.pubkey())));
+            let tx = VersionedTransaction::try_new(message, &[&payer]).expect("sign");
+            let encoded = bs58::encode(wincode::serialize(&tx).expect("serialize")).into_string();
+            if encoded.len().is_multiple_of(4) {
+                return (tx, encoded);
+            }
+        }
+        panic!("no instruction data length gave a base58 encoding of a multiple of four");
+    }
+
+    #[test]
+    fn auto_detects_base58_that_also_decodes_as_base64() {
+        let (tx, encoded) = base58_tx_with_base64_shaped_encoding();
+        assert!(BASE64_STANDARD.decode(&encoded).is_ok());
+
+        let (encoding, _, decoded) = decode_input(&encoded, Encoding::Auto).expect("decode");
+        assert_eq!(encoding, "base58");
+        assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn auto_detects_base64() {
+        let (tx, _) = base58_tx_with_base64_shaped_encoding();
+        let encoded = BASE64_STANDARD.encode(wincode::serialize(&tx).expect("serialize"));
+
+        let (encoding, _, decoded) = decode_input(&encoded, Encoding::Auto).expect("decode");
+        assert_eq!(encoding, "base64");
+        assert_eq!(decoded, tx);
     }
 }
