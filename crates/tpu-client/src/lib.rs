@@ -22,6 +22,75 @@
 //!
 //! This crate come with a _smart_ TPU sender implementation: [YellowstoneTpuSender](`crate::yellowstone_grpc::sender::YellowstoneTpuSender`)
 //!
+//! ## `TpuSenderTxnInfo` metadata model
+//!
+//! The sender no longer carries a dedicated `tx_sig` field in response types.
+//! Instead, callers can attach typed metadata using
+//! [TpuSenderTxnInfo](`crate::core::TpuSenderTxnInfo`) and recover it from
+//! [TpuSenderResponse](`crate::core::TpuSenderResponse`) values.
+//!
+//! Typical usage:
+//!
+//! 1. Build metadata: `let info = TpuSenderTxnInfo::new(signature);`
+//! 2. Send: `sender.send_txn(wire_txn, Some(info)).await?;`
+//! 3. Decode in callback: `resp.info.as_ref().and_then(|i| i.downcast_ref::<Signature>())`
+//!
+//! Metadata constraints:
+//!
+//! - Must be `Copy + Sized + 'static`.
+//! - Must fit in [TXN_INFO_CAP](`crate::TXN_INFO_CAP`) bytes.
+//!
+//! Compile-time capacity tuning:
+//!
+//! - Pick the capacity with a `txn-info-cap-*` feature: `0`, `64` (the default), `128` or `192`.
+//! - For any other size, enable `txn-info-cap-custom` and set `TXN_INFO_CAP` (`64` if unset).
+//!   `build.rs` ignores `TXN_INFO_CAP` without that feature.
+//! - If several tiers end up enabled (Cargo unifies features across dependents), the largest wins,
+//!   so turn off default features to drop the default `txn-info-cap-64`.
+//!
+//! ```sh
+//! TXN_INFO_CAP=100 cargo build -p yellowstone-jet-tpu-client \
+//!     --no-default-features --features yellowstone-grpc,simd-0296,txn-info-cap-custom
+//! ```
+//!
+//! You can inspect the value at runtime:
+//!
+//! ```ignore
+//! use yellowstone_jet_tpu_client::TXN_INFO_CAP;
+//! println!("TXN_INFO_CAP={}", TXN_INFO_CAP);
+//! ```
+//!
+//! See [YellowstoneTpuSender](`crate::yellowstone_grpc::sender::YellowstoneTpuSender`) rustdoc
+//! for a complete end-to-end example covering `TxSent`, `TxFailed`, and `TxDrop`.
+//!
+//! ## `HardenedKeypair`: memory-hardened keypair loading
+//!
+//! [HardenedKeypair](`crate::identity::HardenedKeypair`) is a drop-in alternative to
+//! [`solana_keypair::read_keypair`]/[`solana_keypair::read_keypair_file`] whose private key
+//! bytes are `mlock`ed and zeroized on drop from the moment they first exist, instead of passing
+//! through an ordinary, unlocked `String`/[`solana_keypair::Keypair`] on the way in.
+//!
+//! Construct one via:
+//!
+//! - `HardenedKeypair::read_from_file(path)` / `read_from_reader(&mut reader)` -- same JSON
+//!   `[u8; 64]` keypair file format as `solana_keypair`.
+//! - `HardenedKeypair::new()` -- generate a fresh random one.
+//! - `HardenedKeypair::from_keypair(&keypair)` -- wrap an existing `Keypair`.
+//! - `HardenedKeypair::try_from(&bytes[..])` -- parse raw 64-byte keypair bytes, rejecting a
+//!   mismatched public/secret pair.
+//!
+//! It implements [TpuEd25519SigningKey](`crate::identity::TpuEd25519SigningKey`), so it can be
+//! handed directly to
+//! [TpuIdentity::from_ed25519_signing_key](`crate::identity::TpuIdentity::from_ed25519_signing_key`)
+//! to build the sender's identity without a plain `Keypair` ever existing:
+//!
+//! ```ignore
+//! use yellowstone_jet_tpu_client::identity::{HardenedKeypair, TpuIdentity};
+//!
+//! let hardened = HardenedKeypair::read_from_file("identity.json").expect("read keypair");
+//! let identity = TpuIdentity::from_ed25519_signing_key(&hardened);
+//! ```
+//!
 //! This sender implementation supports three different sending strategies:
 //!
 //! 1. Send transaction to one or more remote peers
@@ -49,6 +118,11 @@ pub mod config;
 ///
 pub mod core;
 ///
+/// module for the TPU sender's identity: a public key paired with its derived, memory-hardened
+/// QUIC client TLS credentials
+///
+pub mod identity;
+///
 /// module for common tpu sender implementation
 ///
 pub mod sender;
@@ -74,3 +148,5 @@ pub mod slot;
 ///
 #[cfg(feature = "yellowstone-grpc")]
 pub mod yellowstone_grpc;
+
+pub use core::TXN_INFO_CAP;

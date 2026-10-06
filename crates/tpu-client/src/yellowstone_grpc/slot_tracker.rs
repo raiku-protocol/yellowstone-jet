@@ -1,23 +1,30 @@
 use {
-    crate::slot::AtomicSlotTracker,
+    crate::{
+        slot::SlotTracker,
+        yellowstone_grpc::subscribe::{AutoReconnectStream, GeyserConnector},
+    },
     futures::Stream,
-    std::{collections::HashMap, panic, sync::Arc},
+    std::{collections::HashMap, panic},
     tokio::task::JoinHandle,
     tokio_stream::StreamExt,
     yellowstone_grpc_client::GeyserGrpcClientResult,
-    yellowstone_grpc_proto::{
-        geyser::{
-            SubscribeRequest, SubscribeRequestFilterSlots, SubscribeUpdate,
-            subscribe_update::UpdateOneof,
-        },
-        tonic::Status,
+    yellowstone_grpc_proto::geyser::{
+        SubscribeRequest, SubscribeRequestFilterSlots, SubscribeUpdate,
+        subscribe_update::UpdateOneof,
     },
 };
 
 pub(crate) const SLOT_TRACKER_DM_FILTER_NAME: &str = "jet-tpu-client";
 
+///
+/// A running slot tracker: the tracker plus the background task that feeds it.
+///
+/// The task resubscribes on its own and does not stop when every [`SlotTracker`] clone is
+/// dropped. Abort `join_handle` to stop it and close its gRPC subscription; dropping the handle
+/// only detaches the task.
+///
 pub struct YellowstoneSlotTrackerOk {
-    pub atomic_slot_tracker: Arc<AtomicSlotTracker>,
+    pub atomic_slot_tracker: SlotTracker,
     pub join_handle: JoinHandle<()>,
 }
 
@@ -35,12 +42,13 @@ pub(crate) fn get_yellowstone_slot_tracker_subscribe_request() -> SubscribeReque
 }
 
 struct AutoCloseSlotTracker {
-    slot_tracker: Arc<AtomicSlotTracker>,
+    slot_tracker: SlotTracker,
 }
 
 impl Drop for AutoCloseSlotTracker {
     fn drop(&mut self) {
         self.slot_tracker
+            .inner
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -49,12 +57,13 @@ impl Drop for AutoCloseSlotTracker {
 ///
 /// Background task to update the AtomicSlotTracker from the Yellowstone Geyser slot stream
 ///
-async fn atomic_slot_tracker_loop<S>(mut dm_slot_stream: S, to_drop: AutoCloseSlotTracker)
+async fn atomic_slot_tracker_loop<S, E>(mut dm_slot_stream: S, to_drop: AutoCloseSlotTracker)
 where
-    S: Stream<Item = Result<SubscribeUpdate, Status>> + Unpin + Send + 'static,
+    S: Stream<Item = Result<SubscribeUpdate, E>> + Unpin + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    let shared = Arc::clone(&to_drop.slot_tracker);
-    let mut current_slot = shared.slot.load(std::sync::atomic::Ordering::Relaxed);
+    let shared = &to_drop.slot_tracker;
+    let mut current_slot = shared.inner.slot.load(std::sync::atomic::Ordering::Relaxed);
     loop {
         let result = dm_slot_stream.next().await;
         if result.is_none() {
@@ -80,6 +89,7 @@ where
                 current_slot = slot;
                 tracing::trace!("Yellowstone slot tracker received slot update: {}", slot);
                 shared
+                    .inner
                     .slot
                     .store(current_slot, std::sync::atomic::Ordering::Relaxed);
             }
@@ -92,13 +102,17 @@ where
 }
 
 ///
-/// Creates an [`AtomicSlotTracker`] that tracks the latest slot from Yellowstone Geyser.
+/// Creates a [`SlotTracker`] that tracks the latest slot from Yellowstone Geyser, and the
+/// background task feeding it. See [`YellowstoneSlotTrackerOk`] for stopping that task.
 ///
 pub async fn atomic_slot_tracker(
     mut geyser_client: yellowstone_grpc_client::GeyserGrpcClient,
 ) -> GeyserGrpcClientResult<Option<YellowstoneSlotTrackerOk>> {
     let subscribe_request = get_yellowstone_slot_tracker_subscribe_request();
-    let mut stream = geyser_client.subscribe_once(subscribe_request).await?;
+
+    let mut stream = geyser_client
+        .subscribe_once(subscribe_request.clone())
+        .await?;
 
     let initial_slot: u64;
     // wait for the first slot update to establish the tip
@@ -129,15 +143,22 @@ pub async fn atomic_slot_tracker(
         }
     }
 
-    let shared: Arc<AtomicSlotTracker> = Arc::new(AtomicSlotTracker::new(initial_slot));
+    let slot_tracker = SlotTracker::new(initial_slot);
+
     let to_drop = AutoCloseSlotTracker {
-        slot_tracker: Arc::clone(&shared),
+        slot_tracker: slot_tracker.clone(),
     };
-    let jh = tokio::spawn(atomic_slot_tracker_loop(stream, to_drop));
+
+    let geyser_connector = GeyserConnector {
+        client: geyser_client,
+        request: subscribe_request,
+    };
+    let auto = AutoReconnectStream::new(geyser_connector, stream);
+    let join_handle = tokio::spawn(atomic_slot_tracker_loop(auto, to_drop));
 
     Ok(Some(YellowstoneSlotTrackerOk {
-        atomic_slot_tracker: shared,
-        join_handle: jh,
+        atomic_slot_tracker: slot_tracker,
+        join_handle,
     }))
 }
 
@@ -146,19 +167,19 @@ mod tests {
 
     use {
         super::*,
-        std::time::Duration,
+        std::{convert::Infallible, time::Duration},
         tokio_stream::wrappers::UnboundedReceiverStream,
         yellowstone_grpc_proto::geyser::{SlotStatus, SubscribeUpdateSlot},
     };
 
     #[tokio::test]
     async fn test_atomic_slot_tracker_loop() {
-        let slot_tracker = Arc::new(AtomicSlotTracker::new(0));
+        let slot_tracker = SlotTracker::new(0);
         let to_drop = AutoCloseSlotTracker {
-            slot_tracker: Arc::clone(&slot_tracker),
+            slot_tracker: slot_tracker.clone(),
         };
 
-        let updates = vec![
+        let updates: Vec<Result<SubscribeUpdate, Infallible>> = vec![
             Ok(SubscribeUpdate {
                 update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
                     slot: 1,
@@ -210,6 +231,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(
             slot_tracker
+                .inner
                 .closed
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
@@ -217,18 +239,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_it_should_poison_when_stream_empty() {
-        let slot_tracker = Arc::new(AtomicSlotTracker::new(0));
+        let slot_tracker = SlotTracker::new(0);
         let to_drop = AutoCloseSlotTracker {
-            slot_tracker: Arc::clone(&slot_tracker),
+            slot_tracker: slot_tracker.clone(),
         };
 
-        let stream = tokio_stream::iter(vec![]);
+        let stream: tokio_stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, Infallible>>> =
+            tokio_stream::iter(vec![]);
         let handle = tokio::spawn(atomic_slot_tracker_loop(stream, to_drop));
 
         let _ = handle.await;
 
         assert!(
             slot_tracker
+                .inner
                 .closed
                 .load(std::sync::atomic::Ordering::Relaxed)
         );

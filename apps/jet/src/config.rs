@@ -1,6 +1,6 @@
 use {
-    crate::{feature_flags::FeatureSet, util::CommitmentLevel},
     anyhow::Context,
+    reqwest::Url,
     serde::{
         Deserialize,
         de::{self, Deserializer},
@@ -10,7 +10,7 @@ use {
     std::{
         collections::HashSet,
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        num::{NonZeroU64, NonZeroUsize},
+        num::NonZeroUsize,
         path::{Path, PathBuf},
         str::FromStr,
     },
@@ -55,9 +55,6 @@ pub struct ConfigJet {
     /// RPC & gRPC for upstream validator
     pub upstream: ConfigUpstream,
 
-    /// jet-gateway endpoints
-    pub jet_gateway: Option<ConfigJetGatewayClient>,
-
     /// Admin server listen options
     pub listen_admin: ConfigListenAdmin,
 
@@ -65,20 +62,20 @@ pub struct ConfigJet {
     pub listen_solana_like: ConfigListenSolanaLike,
 
     /// Send retry options
-    pub send_transaction_service: ConfigSendTransactionService,
+    #[serde(default)]
+    pub send_transaction_service: Option<ConfigSendTransactionService>,
+
+    #[serde(default)]
+    #[deprecated(
+        note = "This option is deprecated and is ignored. Use `enable_yellowstone_shield` instead."
+    )]
+    pub features: Option<de::IgnoredAny>,
 
     /// Quic config
     pub quic: ConfigQuic,
 
-    /// Send events to Lewis
-    pub lewis_events: Option<ConfigLewisEvents>,
-
-    /// Features Flags
-    #[serde(default)]
-    pub features: FeatureSet,
-
-    /// Prometheus Push Gateway
-    pub prometheus: Option<PrometheusConfig>,
+    #[serde(default = "default_true")]
+    pub enable_yellowstone_shield: bool,
 
     /// Shield Program ID (Optional, default to yellowstone-shield-store default)
     #[serde(default, deserialize_with = "ConfigJet::deserialize_maybe_program_id")]
@@ -88,6 +85,10 @@ pub struct ConfigJet {
     /// This is useful for debugging transaction handling errors, but may cause log spam if there are many invalid transactions.
     #[serde(default)]
     pub log_invalid_txn: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl ConfigJet {
@@ -159,7 +160,7 @@ pub struct ConfigUpstream {
 
     /// RPC endpoint
     #[serde(default = "ConfigUpstream::default_rpc")]
-    pub rpc: String,
+    pub rpc: Url,
 
     ///
     /// RPC retry strategy
@@ -190,8 +191,8 @@ impl ConfigUpstream {
         }
     }
 
-    fn default_rpc() -> String {
-        "http://127.0.0.1:8899".to_owned()
+    fn default_rpc() -> Url {
+        Url::parse("http://127.0.0.1:8899").unwrap()
     }
 
     const fn default_cluster_nodes_update_interval() -> Duration {
@@ -207,15 +208,15 @@ impl ConfigUpstream {
 pub struct ConfigUpstreamGrpc {
     /// gRPC service endpoint
     #[serde(default = "ConfigUpstreamGrpc::default_endpoint")]
-    pub endpoint: String,
+    pub endpoint: Url,
 
     /// Optional token for access to gRPC
     pub x_token: Option<String>,
 }
 
 impl ConfigUpstreamGrpc {
-    fn default_endpoint() -> String {
-        "http://127.0.0.1:10000".to_owned()
+    fn default_endpoint() -> Url {
+        Url::parse("http://127.0.0.1:10000").unwrap()
     }
 }
 
@@ -228,9 +229,11 @@ impl From<ConfigUpstream> for PolicyStoreConfig {
         } = config;
 
         PolicyStoreConfig {
-            rpc: PolicyStoreRpcConfig { endpoint: rpc },
+            rpc: PolicyStoreRpcConfig {
+                endpoint: rpc.to_string(),
+            },
             grpc: PolicyStoreGrpcConfig {
-                endpoint,
+                endpoint: endpoint.to_string(),
                 x_token,
                 max_decoding_message_size: Some(100_000_000),
                 commitment: Some(ShieldStoreCommitmentLevel::Confirmed),
@@ -249,46 +252,6 @@ impl From<ConfigUpstream> for PolicyStoreConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct ConfigJetGatewayClient {
-    /// gRPC service endpoints, only one connection would be used
-    pub endpoints: Vec<String>,
-
-    /// Access token
-    pub x_token: Option<String>,
-
-    /// Maximum number of permit that can be received from jet-gateway, overrides staked-based stream computation.
-    /// If set to `None`, then stream size would be computed based on stake.
-    /// It is clipped to the maximum staked-based stream size.
-    #[serde(
-        default,
-        deserialize_with = "ConfigJetGatewayClient::deserialize_maybe_nonzero_u64"
-    )]
-    pub max_streams: Option<NonZeroU64>,
-
-    ///
-    /// Maximum number of subscribe attempts to the jet-gateway.
-    /// If set to `None`, then it would be infinite.
-    #[serde(default = "ConfigJetGatewayClient::default_maximum_subscribe_attempts")]
-    pub maximum_subscribe_attempts: Option<NonZeroUsize>,
-}
-
-impl ConfigJetGatewayClient {
-    fn deserialize_maybe_nonzero_u64<'de, D>(
-        deserializer: D,
-    ) -> Result<Option<NonZeroU64>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // If 0 then fallback to None.
-        Ok(Option::<u64>::deserialize(deserializer)?.and_then(NonZeroU64::new))
-    }
-
-    const fn default_maximum_subscribe_attempts() -> Option<NonZeroUsize> {
-        None
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigListenAdmin {
@@ -302,39 +265,20 @@ pub struct ConfigListenSolanaLike {
     /// RPC listen addresses
     #[serde(deserialize_with = "deserialize_listen")]
     pub bind: Vec<SocketAddr>,
+    ///
+    /// If true (default), the handler will reject transactions that request preflight checks, as preflight is not supported.
+    #[serde(default = "default_true")]
+    pub fail_on_preflight: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConfigSendTransactionService {
-    /// Default max retries of sending transaction
-    pub default_max_retries: Option<usize>,
-
-    /// Service max retries
-    #[serde(default = "ConfigSendTransactionService::default_service_max_retries")]
-    pub service_max_retries: usize,
-
-    /// Stop send transaction when landed at specified commitment
-    #[serde(default = "ConfigSendTransactionService::default_stop_send_on_commitment")]
-    pub stop_send_on_commitment: CommitmentLevel,
-
     /// The number of upcoming leaders to which to forward transactions
     #[deprecated(
         note = "jet already implements smart fanout based on slot timing. Having too high fanout creates jitter."
     )]
     #[serde(default = "ConfigSendTransactionService::default_leader_forward_count")]
     pub leader_forward_count: Option<usize>,
-
-    /// Try to send transaction every retry_rate duration
-    #[serde(
-        default = "ConfigSendTransactionService::default_retry_rate",
-        with = "humantime_serde"
-    )]
-    pub retry_rate: Duration,
-
-    /// Drop transactions from the pool once max retries limit is reached (landed statistic would be invalid)
-    #[serde(default)]
-    pub relay_only_mode: bool,
 
     /// Extra forward (transactions would be always sent to these nodes)
     /// regardless of the transaction yellowstone-shield policies.
@@ -343,20 +287,8 @@ pub struct ConfigSendTransactionService {
 }
 
 impl ConfigSendTransactionService {
-    const fn default_service_max_retries() -> usize {
-        usize::MAX
-    }
-
-    const fn default_stop_send_on_commitment() -> CommitmentLevel {
-        CommitmentLevel::Confirmed
-    }
-
     const fn default_leader_forward_count() -> Option<usize> {
         None
-    }
-
-    const fn default_retry_rate() -> Duration {
-        Duration::from_millis(1_000)
     }
 }
 
@@ -385,139 +317,6 @@ pub struct ConfigQuic {
 impl ConfigQuic {
     const fn default_connection_eviction_grace() -> Duration {
         DEFAULT_EVICTION_GRACE_DURATION
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfigLewisEvents {
-    /// gRPC endpoint for Lewis event service
-    pub endpoint: String,
-
-    /// Optional X-Token for authentication
-    pub x_token: Option<String>,
-
-    /// Events gRPC queue size
-    #[serde(default = "ConfigLewisEvents::default_queue_size_grpc")]
-    pub queue_size_grpc: usize,
-
-    /// Jet ID to use for events
-    #[serde(default)]
-    pub jet_id: Option<String>,
-
-    /// Batch size threshold - number of events before forcing a flush
-    #[serde(default = "ConfigLewisEvents::default_batch_size_threshold")]
-    pub batch_size_threshold: u64,
-
-    /// Batch timeout - max time to wait before flushing events
-    #[serde(
-        default = "ConfigLewisEvents::default_batch_timeout",
-        with = "humantime_serde"
-    )]
-    pub batch_timeout: Duration,
-
-    /// Connection timeout for Lewis gRPC
-    #[serde(
-        default = "ConfigLewisEvents::default_connect_timeout",
-        with = "humantime_serde"
-    )]
-    pub connect_timeout: Duration,
-
-    /// HTTP2 keepalive interval
-    #[serde(
-        default = "ConfigLewisEvents::default_keepalive_interval",
-        with = "humantime_serde"
-    )]
-    pub keepalive_interval: Duration,
-
-    /// Keepalive timeout
-    #[serde(
-        default = "ConfigLewisEvents::default_keepalive_timeout",
-        with = "humantime_serde"
-    )]
-    pub keepalive_timeout: Duration,
-
-    /// Size of internal event buffer between handler and client
-    #[serde(default = "ConfigLewisEvents::default_event_buffer_size")]
-    pub event_buffer_size: usize,
-
-    /// Keep HTTP2 connection alive even when idle
-    #[serde(default = "ConfigLewisEvents::default_keep_alive_while_idle")]
-    pub keep_alive_while_idle: bool,
-
-    /// Maximum number of reconnection attempts
-    #[serde(default = "ConfigLewisEvents::default_max_reconnect_attempts")]
-    pub max_reconnect_attempts: usize,
-
-    /// Initial interval for reconnection backoff
-    #[serde(
-        default = "ConfigLewisEvents::default_reconnect_initial_interval",
-        with = "humantime_serde"
-    )]
-    pub reconnect_initial_interval: Duration,
-
-    /// Maximum interval for reconnection backoff
-    #[serde(
-        default = "ConfigLewisEvents::default_reconnect_max_interval",
-        with = "humantime_serde"
-    )]
-    pub reconnect_max_interval: Duration,
-
-    /// Maximum time for the entire stream
-    #[serde(
-        default = "ConfigLewisEvents::default_stream_timeout",
-        with = "humantime_serde"
-    )]
-    pub stream_timeout: Duration,
-}
-
-impl ConfigLewisEvents {
-    const fn default_queue_size_grpc() -> usize {
-        10_000
-    }
-
-    const fn default_batch_size_threshold() -> u64 {
-        512
-    }
-
-    const fn default_batch_timeout() -> Duration {
-        Duration::from_millis(1000)
-    }
-
-    const fn default_connect_timeout() -> Duration {
-        Duration::from_secs(10)
-    }
-
-    const fn default_keepalive_interval() -> Duration {
-        Duration::from_secs(30)
-    }
-
-    const fn default_keepalive_timeout() -> Duration {
-        Duration::from_secs(10)
-    }
-
-    const fn default_event_buffer_size() -> usize {
-        100_000
-    }
-
-    const fn default_keep_alive_while_idle() -> bool {
-        true
-    }
-
-    const fn default_max_reconnect_attempts() -> usize {
-        3
-    }
-
-    const fn default_reconnect_initial_interval() -> Duration {
-        Duration::from_millis(1000)
-    }
-
-    const fn default_reconnect_max_interval() -> Duration {
-        Duration::from_secs(30)
-    }
-
-    const fn default_stream_timeout() -> Duration {
-        Duration::from_secs(300) // 0 means no timeout
     }
 }
 
@@ -618,40 +417,5 @@ pub struct PrometheusConfig {
 impl PrometheusConfig {
     const fn default_push_interval() -> Duration {
         Duration::from_secs(10)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_deser_jet_gateway_client() {
-        let yaml = r#"
-        max_streams: null
-        endpoints:
-            - http://127.0.0.1:8002
-        # Access token
-        x_token: null
-        "#;
-
-        let cfg: ConfigJetGatewayClient = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.endpoints, vec!["http://127.0.0.1:8002"]);
-        assert_eq!(cfg.max_streams, None);
-        assert_eq!(cfg.x_token, None);
-
-        // Interpret 0 as None
-        let yaml = r#"
-        max_streams: 0
-        endpoints:
-            - http://127.0.0.1:8002
-        # Access token
-        x_token: null
-        "#;
-
-        let cfg: ConfigJetGatewayClient = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.endpoints, vec!["http://127.0.0.1:8002"]);
-        assert_eq!(cfg.max_streams, None);
-        assert_eq!(cfg.x_token, None);
     }
 }

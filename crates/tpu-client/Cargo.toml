@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-jet-tpu-client"
-version = "0.4.0"
+version = "0.8.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -16,24 +16,40 @@ exclude = ["src/bin/*"]
 [[bin]]
 name = "test-managed-schedule"
 path = "src/bin/test-managed-schedule.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "test-tpu-info"
 path = "src/bin/test-tpu-info.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "test-tpu-send"
 path = "src/bin/test-tpu-send.rs"
+required-features = ["examples"]
 
 [[bin]]
 name = "test-slot-tracker"
 path = "src/bin/test-slot-tracker.rs"
+required-features = ["examples"]
 
 [features]
-default = ["yellowstone-grpc"]
+default = ["yellowstone-grpc", "txn-info-cap-64", "simd-0296"]
+###
+### `TXN_INFO_CAP` capacity tuning -- enable exactly one. See build.rs.
+###
+txn-info-cap-0 = []
+txn-info-cap-64 = []
+txn-info-cap-128 = []
+txn-info-cap-192 = []
+###
+### Reads the `TXN_INFO_CAP` env var at build time (defaults to 64 if unset), for callers who
+### need a capacity not covered by the fixed tiers above.
+###
+txn-info-cap-custom = []
 prometheus = ["dep:prometheus"]
 examples = [
-    "dep:bincode",
+    "dep:wincode",
     "dep:clap",
     "dep:dotenvy",
     "dep:solana-hash",
@@ -49,17 +65,25 @@ yellowstone-grpc = [
 ]
 shield = ["dep:yellowstone-shield-store"]
 intg-testing = []
+###
+### SIMD-0296 raises Solana's max transaction size from 1232 to 4096 bytes, sizing
+### `PACKET_DATA_SIZE` (and the `accept_tx` size check that uses it) accordingly. On by
+### default; disable with `--no-default-features` for a cluster that has not activated it.
+###
+simd-0296 = []
 
 [dependencies]
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
-bincode = { workspace = true, optional = true }
+wincode = { workspace = true, optional = true }
 borsh = { workspace = true }
 bs58 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["cargo", "derive", "env"], optional = true }
 derive_more = { workspace = true, features = ["display"] }
 dotenvy = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
 http-body-util = { workspace = true }
@@ -72,6 +96,7 @@ prometheus = { workspace = true, optional = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 rand = { workspace = true }
+region = { workspace = true }
 retry = { workspace = true }
 rustls = { workspace = true }
 semver = { workspace = true }
@@ -84,13 +109,15 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "json"], optional = true }
+url = { workspace = true, features = ["serde"] }
+zeroize = { workspace = true }
 
 # Agave Monorepo
 solana-client = { workspace = true }
 solana-net-utils = { workspace = true, features = ["agave-unstable-api"] }
 solana-rpc-client = { workspace = true, optional = true }
 solana-rpc-client-api = { workspace = true }
-solana-system-interface = { workspace = true, optional = true, features = ["bincode"] }
+solana-system-interface = { workspace = true, optional = true }
 solana-tls-utils = { workspace = true, features = ["agave-unstable-api"] }
 solana-version = { workspace = true }
 
@@ -114,6 +141,10 @@ yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
 yellowstone-shield-store = { workspace = true, optional = true }
 
-
 [dev-dependencies]
 x509-parser = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "json"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ use {
         sync::{Arc, RwLock, atomic::AtomicBool},
     },
     tokio::task::JoinHandle,
+    tokio_util::sync::{CancellationToken, DropGuard},
 };
 
 pub const DEFAULT_AUTO_LEADER_SCHEDULE_CHECK_INTERVAL: std::time::Duration =
@@ -26,7 +27,7 @@ pub struct CompactSortedSchedule {
 
 impl CompactSortedSchedule {
     #[inline]
-    pub fn last_slot(&self) -> u64 {
+    pub const fn last_slot(&self) -> u64 {
         self.first_slot + DEFAULT_SLOTS_PER_EPOCH - 1
     }
 
@@ -146,16 +147,29 @@ struct InnerManagedLeaderSchedule {
 #[derive(Clone)]
 pub struct ManagedLeaderSchedule {
     inner: Arc<RwLock<InnerManagedLeaderSchedule>>,
+    /// Shared only by the public handles, so the last handle's drop cancels the background update
+    /// loop. `inner` can't tell: the loop holds its own clone of it.
+    _cancel_on_last_drop: Arc<DropGuard>,
 }
 
 ///
 /// Error indicating that the AutoLeaderSchedule background update task has failed.
 ///
 #[derive(Debug, thiserror::Error)]
-#[error("auto leader schedule poisoned")]
-pub struct PoisonError;
+#[error("auto leader schedule disconnected")]
+pub struct GetLeaderError;
 
 impl ManagedLeaderSchedule {
+    fn from_parts(
+        inner: Arc<RwLock<InnerManagedLeaderSchedule>>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            _cancel_on_last_drop: Arc::new(shutdown.drop_guard()),
+        }
+    }
+
     ///
     /// Get the leader for a given slot.
     ///
@@ -163,18 +177,18 @@ impl ManagedLeaderSchedule {
     ///
     /// - `Ok(Some(Pubkey))` if the leader for the slot is found.
     /// - `Ok(None)` if the slot is out of range of the current schedules.
-    /// - `Err(PoisonError)` if the background update task has failed.
+    /// - `Err(GetLeaderError)` if the background update task has failed.
     ///
     /// # Errors
     ///
-    /// Returns `PoisonError` if the background update task has failed.
+    /// Returns `GetLeaderError` if the background update task has failed.
     ///
-    pub fn get_leader(&self, slot: u64) -> Result<Option<Pubkey>, PoisonError> {
+    pub fn get_leader(&self, slot: u64) -> Result<Option<Pubkey>, GetLeaderError> {
         let schedules = self.inner.read().unwrap();
         // Relaxed ordering is sufficient here since fail does not protect any data.
         // We already use RwLock to protect the double_buffer data.
         if schedules.fail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(PoisonError);
+            return Err(GetLeaderError);
         }
         let schedule = if slot >= schedules.double_buffer[1].first_slot {
             &schedules.double_buffer[1]
@@ -183,13 +197,46 @@ impl ManagedLeaderSchedule {
         };
         Ok(schedule.get(&slot).cloned())
     }
+
+    ///
+    /// Builds a [`ManagedLeaderSchedule`] with a fixed, never-updating schedule, for tests that
+    /// need deterministic leader lookups without spawning [`spawn_managed_leader_schedule`]'s
+    /// background RPC polling.
+    ///
+    /// `first_slot` is the first slot of the epoch `schedule` covers; `schedule` holds one
+    /// pubkey per 4-slot leader boundary, starting at `first_slot` (see [`CompactSortedSchedule::get`]).
+    /// The same schedule is used for both the current and next epoch's double buffer.
+    ///
+    #[cfg(any(test, feature = "intg-testing"))]
+    pub fn new_for_test(first_slot: u64, schedule: Vec<Pubkey>) -> Self {
+        Self::new_for_test_with_shutdown(first_slot, schedule, CancellationToken::new())
+    }
+
+    #[cfg(any(test, feature = "intg-testing"))]
+    fn new_for_test_with_shutdown(
+        first_slot: u64,
+        schedule: Vec<Pubkey>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let compact = CompactSortedSchedule {
+            first_slot,
+            schedule,
+        };
+        Self::from_parts(
+            Arc::new(RwLock::new(InnerManagedLeaderSchedule {
+                double_buffer: [compact.clone(), compact],
+                fail: AtomicBool::new(false),
+            })),
+            shutdown,
+        )
+    }
 }
 
 async fn auto_leader_schedule_loop(
     config: ManagedLeaderScheduleConfig,
     shared: Arc<RwLock<InnerManagedLeaderSchedule>>,
     rpc_client: Arc<RpcClient>,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    cancellation_token: CancellationToken,
 ) {
     pub struct OnDrop {
         shared: Option<Arc<RwLock<InnerManagedLeaderSchedule>>>,
@@ -306,7 +353,7 @@ impl ManagedLeaderScheduleConfig {
     ///
     /// Default check interval duration.
     ///
-    pub fn default_check_interval() -> std::time::Duration {
+    pub const fn default_check_interval() -> std::time::Duration {
         DEFAULT_AUTO_LEADER_SCHEDULE_CHECK_INTERVAL
     }
 }
@@ -344,14 +391,17 @@ pub async fn spawn_managed_leader_schedule(
         fail: AtomicBool::new(false),
     }));
 
-    let shared_clone = shared.clone();
-    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let shared_clone = Arc::clone(&shared);
+    let cancellation_token = CancellationToken::new();
     let loop_ct = cancellation_token.clone();
     let jh = tokio::spawn(async move {
         auto_leader_schedule_loop(config, shared_clone, rpc_client, loop_ct).await;
     });
 
-    Ok((ManagedLeaderSchedule { inner: shared }, jh))
+    Ok((
+        ManagedLeaderSchedule::from_parts(shared, cancellation_token),
+        jh,
+    ))
 }
 
 #[cfg(test)]
@@ -361,7 +411,62 @@ mod tests {
         solana_clock::DEFAULT_SLOTS_PER_EPOCH,
         solana_pubkey::Pubkey,
         std::collections::BTreeMap,
+        tokio_util::sync::CancellationToken,
     };
+
+    #[test]
+    fn drop_of_non_last_clone_does_not_cancel_shutdown() {
+        let shutdown = CancellationToken::new();
+        let schedule = super::ManagedLeaderSchedule::new_for_test_with_shutdown(
+            0,
+            vec![Pubkey::new_unique()],
+            shutdown.clone(),
+        );
+        let schedule2 = schedule.clone();
+
+        drop(schedule);
+        assert!(
+            !shutdown.is_cancelled(),
+            "dropping one clone must not cancel while another clone exists"
+        );
+
+        drop(schedule2);
+        assert!(
+            shutdown.is_cancelled(),
+            "dropping the last clone must cancel shutdown"
+        );
+    }
+
+    #[test]
+    fn drop_of_last_handle_cancels_shutdown_while_update_loop_holds_state() {
+        let shutdown = CancellationToken::new();
+        let schedule = super::ManagedLeaderSchedule::new_for_test_with_shutdown(
+            0,
+            vec![Pubkey::new_unique()],
+            shutdown.clone(),
+        );
+        // What `spawn_managed_leader_schedule` hands its update loop.
+        let _update_loop_state = std::sync::Arc::clone(&schedule.inner);
+
+        drop(schedule);
+        assert!(
+            shutdown.is_cancelled(),
+            "the loop's own clone of the state must not keep it running"
+        );
+    }
+
+    #[test]
+    fn drop_of_last_instance_cancels_shutdown() {
+        let shutdown = CancellationToken::new();
+        let schedule = super::ManagedLeaderSchedule::new_for_test_with_shutdown(
+            0,
+            vec![Pubkey::new_unique()],
+            shutdown.clone(),
+        );
+
+        drop(schedule);
+        assert!(shutdown.is_cancelled(), "last drop must cancel shutdown");
+    }
 
     fn exponential_distribution(n: usize, base: f64, r: f64) -> Vec<u64> {
         // returns a vector of stake weights

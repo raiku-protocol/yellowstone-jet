@@ -1,6 +1,7 @@
 use {
     crate::{
-        payload::JetRpcSendTransactionConfig, solana::decode_and_deserialize,
+        payload::JetRpcSendTransactionConfig,
+        solana::{decode_and_deserialize, get_durable_nonce},
         transactions::SendTransactionRequest,
     },
     anyhow::Result,
@@ -11,9 +12,9 @@ use {
     solana_transaction::versioned::VersionedTransaction,
     solana_transaction_status_client_types::UiTransactionEncoding,
     solana_version::Version,
-    std::sync::Arc,
     thiserror::Error,
     tokio::sync::mpsc,
+    uuid::Uuid,
     yellowstone_jet_tpu_client::core::PACKET_DATA_SIZE,
 };
 
@@ -23,7 +24,7 @@ pub enum TransactionHandlerError {
     InvalidTransaction(String),
 
     #[error("failed to serialize transaction: {0}")]
-    SerializationFailed(#[from] bincode::Error),
+    SerializationFailed(#[from] wincode::WriteError),
 
     #[error("preflight check is not supported")]
     PreflightNotSupported,
@@ -61,12 +62,21 @@ impl From<TransactionHandlerError> for ErrorObjectOwned {
 
 #[derive(Clone)]
 pub struct TransactionHandler {
-    pub transaction_sink: mpsc::UnboundedSender<Arc<SendTransactionRequest>>,
+    ///
+    /// If true (default), the handler will reject transactions that request preflight checks, as preflight is not supported.
+    fail_on_preflight: bool,
+    transaction_sink: mpsc::Sender<SendTransactionRequest>,
 }
 
 impl TransactionHandler {
-    pub const fn new(transaction_sink: mpsc::UnboundedSender<Arc<SendTransactionRequest>>) -> Self {
-        Self { transaction_sink }
+    pub const fn new(
+        transaction_sink: mpsc::Sender<SendTransactionRequest>,
+        fail_on_preflight: bool,
+    ) -> Self {
+        Self {
+            fail_on_preflight,
+            transaction_sink,
+        }
     }
 
     pub fn get_version() -> RpcVersionInfo {
@@ -81,11 +91,13 @@ impl TransactionHandler {
         &self,
         transaction: VersionedTransaction,
         config_with_forwarding_policies: JetRpcSendTransactionConfig,
+        x_request_id: Option<Uuid>,
+        x_subscription_id: Option<Uuid>,
     ) -> Result<String /* Signature */, TransactionHandlerError> {
         let config = config_with_forwarding_policies.config;
 
         // Reject transactions requesting preflight, not supported
-        if !config.skip_preflight {
+        if !config.skip_preflight && self.fail_on_preflight {
             return Err(TransactionHandlerError::PreflightNotSupported);
         }
 
@@ -95,7 +107,7 @@ impl TransactionHandler {
             .map_err(|e| TransactionHandlerError::InvalidTransaction(e.to_string()))?;
 
         let signature = transaction.signatures[0];
-        let wire_transaction = bincode::serialize(&transaction)?;
+        let wire_transaction = wincode::serialize(&transaction)?;
         if wire_transaction.len() > PACKET_DATA_SIZE {
             return Err(TransactionHandlerError::InvalidTransaction(format!(
                 "transaction size {} exceeds maximum allowed size of {} bytes",
@@ -103,15 +115,20 @@ impl TransactionHandler {
                 PACKET_DATA_SIZE
             )));
         }
-
+        let signer = transaction.message.static_account_keys()[0];
+        let req = SendTransactionRequest {
+            signature,
+            wire_transaction: wire_transaction.into(),
+            policies: config_with_forwarding_policies.forwarding_policies,
+            x_request_id,
+            x_subscription_id,
+            signer,
+            durable_nonce: get_durable_nonce(&transaction),
+            recent_blockhash: *transaction.message.recent_blockhash(),
+        };
         self.transaction_sink
-            .send(Arc::new(SendTransactionRequest {
-                signature,
-                transaction,
-                wire_transaction: wire_transaction.into(),
-                max_retries: config.max_retries,
-                policies: config_with_forwarding_policies.forwarding_policies,
-            }))
+            .send(req)
+            .await
             .expect("transaction sink closed");
 
         Ok(signature.to_string())
@@ -121,6 +138,8 @@ impl TransactionHandler {
         &self,
         wire_transaction: Bytes,
         config_with_forwarding_policies: JetRpcSendTransactionConfig,
+        x_request_id: Option<Uuid>,
+        x_subscription_id: Option<Uuid>,
     ) -> Result<String /* Signature */, TransactionHandlerError> {
         if wire_transaction.len() > PACKET_DATA_SIZE {
             return Err(TransactionHandlerError::InvalidTransaction(format!(
@@ -130,7 +149,7 @@ impl TransactionHandler {
             )));
         }
 
-        let transaction: VersionedTransaction = bincode::deserialize(wire_transaction.as_ref())
+        let transaction: VersionedTransaction = wincode::deserialize(wire_transaction.as_ref())
             .map_err(|e| {
                 TransactionHandlerError::InvalidParams(format!(
                     "failed to deserialize transaction: {e}"
@@ -142,15 +161,20 @@ impl TransactionHandler {
             .map_err(|e| TransactionHandlerError::InvalidTransaction(e.to_string()))?;
 
         let signature = transaction.signatures[0];
-
+        let signer = transaction.message.static_account_keys()[0];
+        let req = SendTransactionRequest {
+            signature,
+            wire_transaction,
+            policies: config_with_forwarding_policies.forwarding_policies,
+            x_request_id,
+            durable_nonce: get_durable_nonce(&transaction),
+            recent_blockhash: *transaction.message.recent_blockhash(),
+            x_subscription_id,
+            signer,
+        };
         self.transaction_sink
-            .send(Arc::new(SendTransactionRequest {
-                signature,
-                transaction,
-                wire_transaction,
-                max_retries: config_with_forwarding_policies.config.max_retries,
-                policies: config_with_forwarding_policies.forwarding_policies,
-            }))
+            .send(req)
+            .await
             .expect("transaction sink closed");
 
         Ok(signature.to_string())
@@ -160,6 +184,8 @@ impl TransactionHandler {
         &self,
         data: String,
         config_with_forwarding_policies: Option<JetRpcSendTransactionConfig>,
+        x_request_id: Option<Uuid>,
+        x_subscription_id: Option<Uuid>,
     ) -> Result<String /* Signature */, TransactionHandlerError> {
         let config_with_forwarding_policies = config_with_forwarding_policies.unwrap_or_default();
         let config = config_with_forwarding_policies.config;
@@ -167,14 +193,20 @@ impl TransactionHandler {
         let (wire_transaction, transaction) = self.prepare_transaction(data, config).await?;
         let signature = transaction.signatures[0];
 
+        let signer = transaction.message.static_account_keys()[0];
+        let req = SendTransactionRequest {
+            signature,
+            wire_transaction: wire_transaction.into(),
+            policies: config_with_forwarding_policies.forwarding_policies,
+            x_request_id,
+            durable_nonce: get_durable_nonce(&transaction),
+            recent_blockhash: *transaction.message.recent_blockhash(),
+            x_subscription_id,
+            signer,
+        };
         self.transaction_sink
-            .send(Arc::new(SendTransactionRequest {
-                signature,
-                transaction,
-                wire_transaction: wire_transaction.into(),
-                max_retries: config.max_retries,
-                policies: config_with_forwarding_policies.forwarding_policies,
-            }))
+            .send(req)
+            .await
             .expect("transaction sink closed");
 
         Ok(signature.to_string())
@@ -196,7 +228,7 @@ impl TransactionHandler {
         .map_err(|e| TransactionHandlerError::InvalidParams(e.to_string()))?;
 
         // Reject transactions requesting preflight, not supported
-        if !config.skip_preflight {
+        if !config.skip_preflight && self.fail_on_preflight {
             return Err(TransactionHandlerError::PreflightNotSupported);
         }
 

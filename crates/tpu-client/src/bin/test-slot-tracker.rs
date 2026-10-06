@@ -8,7 +8,7 @@ use {
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt},
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
-    yellowstone_jet_tpu_client::{self, yellowstone_grpc::slot_tracker::YellowstoneSlotTrackerOk},
+    yellowstone_jet_tpu_client::{self},
 };
 
 pub fn setup_tracing() {
@@ -77,9 +77,9 @@ async fn main() {
         .await
         .expect("connect");
 
-    let YellowstoneSlotTrackerOk {
+    let yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::YellowstoneSlotTrackerOk {
         atomic_slot_tracker,
-        mut join_handle,
+        join_handle: _slot_tracker_jh,
     } = yellowstone_jet_tpu_client::yellowstone_grpc::slot_tracker::atomic_slot_tracker(
         geyser_client,
     )
@@ -93,10 +93,6 @@ async fn main() {
         tokio::select! {
             _ = interval.tick() => {},
             _ = &mut ctrlc => break,
-            _ = &mut join_handle => {
-                tracing::error!("Yellowstone slot tracker task exited unexpectedly");
-                break;
-            }
         }
         let slot = atomic_slot_tracker.load().expect("load");
         writeln!(&mut out, "Current Yellowstone slot: {slot}").expect("write");

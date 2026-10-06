@@ -29,7 +29,8 @@ use {
     clap::Parser,
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_commitment_config::CommitmentConfig,
-    solana_keypair::Keypair,
+    solana_hash::Hash,
+    solana_keypair::{Keypair, Signature},
     solana_message::{VersionedMessage, v0},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
@@ -44,10 +45,13 @@ use {
     },
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt},
+    url::Url,
     yellowstone_jet_tpu_client::{
-        core::TpuSenderResponse,
+        core::{TpuSenderResponse, TpuSenderTxnInfo},
+        identity::TpuIdentity,
         yellowstone_grpc::sender::{
-            Endpoints, NewYellowstoneTpuSender, create_yellowstone_tpu_sender,
+            Endpoints, NewYellowstoneTpuSender, YellowstoneTpuSender, YellowstoneTpuSenderConfig,
+            create_yellowstone_tpu_sender_with_callback,
         },
     },
 };
@@ -64,27 +68,35 @@ pub fn setup_tracing() {
     subscriber.with(io_layer).try_init().expect("try_init");
 }
 
-#[derive(clap::Parser, Debug)]
-struct Args {
-    #[clap(long, short)]
-    /// Path to .env file to load
-    dotenv: Option<PathBuf>,
-    /// Endpoint to Yellowstone gRPC service
-    #[clap(long, short)]
-    rpc: Option<String>,
-    #[clap(long, short)]
-    grpc: Option<String>,
-    /// X-Token for Yellowstone gRPC service
-    x_token: Option<String>,
-    ///
-    /// Path to identity keypair file
-    ///
-    identity: Option<PathBuf>,
-    ///
-    /// Recipient pubkey
-    ///
-    #[clap(long)]
-    recipient: Option<String>,
+async fn send_lamports(
+    mut tpu_sender: YellowstoneTpuSender,
+    identity: &Keypair,
+    recipient: &Pubkey,
+    lamports: u64,
+    latest_blockhash: Hash,
+) -> Signature {
+    let instructions = vec![transfer(&identity.pubkey(), recipient, lamports)];
+
+    let transaction = VersionedTransaction::try_new(
+        VersionedMessage::V0(
+            v0::Message::try_compile(&identity.pubkey(), &instructions, &[], latest_blockhash)
+                .expect("try_compile"),
+        ),
+        &[&identity],
+    )
+    .expect("try_new");
+    let signature = transaction.signatures[0];
+    tracing::info!("generate transaction {signature} with send lamports {lamports}");
+    let wire_txn = wincode::serialize(&transaction).expect("wincode::serialize");
+
+    let txn_info = TpuSenderTxnInfo::new(signature);
+    // Send the transaction to the current leader
+    tpu_sender
+        .send_txn(wire_txn, Some(txn_info))
+        .await
+        .expect("send_transaction");
+
+    signature
 }
 
 #[tokio::main]
@@ -110,14 +122,20 @@ async fn main() {
 
     let rpc_endpoint = match args.rpc {
         Some(endpoint) => endpoint,
-        None => env::var("RPC_ENDPOINT")
-            .expect("RPC_ENDPOINT must be set in dotenv file or environment"),
+        None => Url::parse(
+            &env::var("RPC_ENDPOINT")
+                .expect("RPC_ENDPOINT must be set in dotenv file or environment"),
+        )
+        .expect("Failed to parse RPC_ENDPOINT"),
     };
 
     let grpc_endpoint = match args.grpc {
         Some(endpoint) => endpoint,
-        None => env::var("GRPC_ENDPOINT")
-            .expect("GRPC_ENDPOINT must be set in dotenv file or environment"),
+        None => Url::parse(
+            &env::var("GRPC_ENDPOINT")
+                .expect("GRPC_ENDPOINT must be set in dotenv file or environment"),
+        )
+        .expect("Failed to parse GRPC_ENDPOINT"),
     };
 
     let grpc_x_token = match args.x_token {
@@ -149,7 +167,7 @@ async fn main() {
     };
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
-        rpc_endpoint.clone(),
+        rpc_endpoint.to_string(),
         CommitmentConfig::confirmed(),
     ));
 
@@ -159,55 +177,232 @@ async fn main() {
         grpc: grpc_endpoint,
         grpc_x_token,
     };
+    let config = YellowstoneTpuSenderConfig {
+        endpoints,
+        ..Default::default()
+    };
+
+    let tpu_identity = TpuIdentity::from_keypair(&identity);
+
+    let (callback_tx, mut callback_rx) = tokio::sync::mpsc::unbounded_channel();
     let NewYellowstoneTpuSender {
-        mut sender,
+        sender,
         related_objects_jh: _,
-        mut response,
-    } = create_yellowstone_tpu_sender(Default::default(), identity.insecure_clone(), endpoints)
+    } = create_yellowstone_tpu_sender_with_callback(config, tpu_identity, callback_tx)
         .await
         .expect("tpu-sender");
 
     const LAMPORTS: u64 = 1000;
-    let instructions = vec![transfer(&identity.pubkey(), &recipient_pubkey, LAMPORTS)];
 
     let latest_blockhash = rpc_client
         .get_latest_blockhash()
         .await
         .expect("get_latest_blockhash");
-
-    let transaction = VersionedTransaction::try_new(
-        VersionedMessage::V0(
-            v0::Message::try_compile(&identity.pubkey(), &instructions, &[], latest_blockhash)
-                .expect("try_compile"),
-        ),
-        &[&identity],
+    let signature = send_lamports(
+        sender,
+        &identity,
+        &recipient_pubkey,
+        LAMPORTS,
+        latest_blockhash,
     )
-    .expect("try_new");
-    let signature = transaction.signatures[0];
-    tracing::info!("generate transaction {signature} with send lamports {LAMPORTS}");
-    let bincoded_txn = bincode::serialize(&transaction).expect("bincode::serialize");
+    .await;
 
-    // Send the transaction to the current leader
-    sender
-        .send_txn(signature, bincoded_txn)
+    let TpuSenderResponse::TxSent(resp) = callback_rx
+        .recv()
         .await
-        .expect("send_transaction");
-
-    let TpuSenderResponse::TxSent(resp) = response.recv().await.expect("response") else {
-        panic!("unexpected response");
+        .expect("receive tpu sender response")
+    else {
+        panic!("unexpected tpu sender response");
     };
 
+    let Some(txn_info) = resp.info else {
+        panic!("unexpected tpu sender response without txn info");
+    };
+
+    let actual_sig = txn_info
+        .downcast_ref::<Signature>()
+        .copied()
+        .expect("downcast_ref::<Signature>");
+
     assert!(
-        resp.tx_sig == signature,
+        actual_sig == signature,
         "unexpected tx signature in response"
     );
+
     writeln!(
         &mut out,
         "sent transaction with signature `{}` to validator `{}`",
-        resp.tx_sig, resp.remote_peer_identity
+        actual_sig, resp.remote_peer_identity
     )
     .expect("writeln");
 }
+
+#[derive(clap::Parser, Debug)]
+struct Args {
+    #[clap(long, short)]
+    /// Path to .env file to load
+    dotenv: Option<PathBuf>,
+    /// Endpoint to Yellowstone gRPC service
+    #[clap(long, short)]
+    rpc: Option<Url>,
+    #[clap(long, short)]
+    grpc: Option<Url>,
+    /// X-Token for Yellowstone gRPC service
+    x_token: Option<String>,
+    ///
+    /// Path to identity keypair file
+    ///
+    identity: Option<PathBuf>,
+    ///
+    /// Recipient pubkey
+    ///
+    #[clap(long)]
+    recipient: Option<String>,
+}
+```
+
+## `HardenedKeypair`: memory-hardened keypair loading
+
+The `Usage` example above loads the identity with `solana_keypair::read_keypair_file`, which reads
+the whole keypair file into an ordinary, unlocked `String` before parsing it -- the private key
+exists, at least transiently, in memory that can be swapped to disk and isn't wiped on drop.
+
+`HardenedKeypair` (in the `identity` module) is a drop-in alternative that keeps the private key
+`mlock`ed and zeroized on drop from the moment it first exists, and never copies it into an
+unlocked allocation on the way in.
+
+Construct one via:
+
+- `HardenedKeypair::read_from_file(path)` / `read_from_reader(&mut reader)` -- parses the same
+  JSON `[u8; 64]` keypair file format as `solana_keypair`, without ever putting the file's text
+  (which spells the secret out in ASCII) into an unlocked buffer.
+- `HardenedKeypair::new()` -- generates a fresh random one.
+- `HardenedKeypair::from_keypair(&keypair)` -- wraps an existing `solana_keypair::Keypair`.
+- `HardenedKeypair::try_from(&bytes[..])` -- parses raw 64-byte keypair bytes, rejecting the
+  pair if the public half doesn't actually correspond to the secret half.
+
+It implements `TpuEd25519SigningKey`, so it plugs directly into
+`TpuIdentity::from_ed25519_signing_key`, which builds the QUIC client TLS identity used by the
+sender -- a plain `Keypair` never needs to exist on the way there:
+
+```rust
+use yellowstone_jet_tpu_client::identity::{HardenedKeypair, TpuIdentity};
+
+let hardened = HardenedKeypair::read_from_file("/path/to/identity.json")
+    .expect("read identity keypair file");
+
+println!("identity pubkey: {}", hardened.pubkey());
+
+let identity = TpuIdentity::from_ed25519_signing_key(&hardened);
+```
+
+The resulting `identity` is what you pass to `create_yellowstone_tpu_sender`/
+`YellowstoneTpuSender`, exactly as a `TpuIdentity::from_keypair(&keypair)` would be in the
+`Usage` example above -- the rest of the sender setup is unchanged.
+
+## `TpuSenderTxnInfo` detailed usage
+
+`TpuSenderTxnInfo` is an optional typed metadata envelope attached to each `TpuSenderTxn`.
+`TpuSenderResponse` carries this metadata back in `TxSent`, `TxFailed`, and `TxDrop` responses.
+
+Key points:
+
+- The value must be `Copy + Sized + 'static`.
+- The encoded value must fit in `TXN_INFO_CAP` bytes.
+- You recover the original type using `downcast_ref::<T>()`.
+
+```rust
+use {
+    solana_signature::Signature,
+    yellowstone_jet_tpu_client::core::{TpuSenderResponse, TpuSenderTxnInfo, TXN_INFO_CAP},
+};
+
+#[derive(Clone, Copy, Debug)]
+struct TxMeta {
+    sig: Signature,
+    attempt: u16,
+}
+
+fn read_meta(info: &Option<TpuSenderTxnInfo>) -> Option<TxMeta> {
+    info.as_ref().and_then(|i| i.downcast_ref::<TxMeta>()).copied()
+}
+
+async fn send_with_metadata(
+    sender: &mut yellowstone_jet_tpu_client::yellowstone_grpc::sender::YellowstoneTpuSender,
+    wire: Vec<u8>,
+    sig: Signature,
+) {
+    assert!(std::mem::size_of::<TxMeta>() <= TXN_INFO_CAP);
+    let meta = TxMeta { sig, attempt: 1 };
+
+    sender
+        .send_txn(wire, Some(TpuSenderTxnInfo::new(meta)))
+        .await
+        .expect("send_txn");
+}
+
+fn handle_response(resp: TpuSenderResponse) {
+    match resp {
+        TpuSenderResponse::TxSent(ok) => {
+            if let Some(meta) = read_meta(&ok.info) {
+                println!("sent {} attempt {}", meta.sig, meta.attempt);
+            }
+        }
+        TpuSenderResponse::TxFailed(err) => {
+            if let Some(meta) = read_meta(&err.info) {
+                println!("failed {}: {}", meta.sig, err.failure_reason);
+            }
+        }
+        TpuSenderResponse::TxDrop(drop) => {
+            for (txn, _attempt) in drop.dropped_tx_vec {
+                if let Some(meta) = read_meta(&txn.info) {
+                    println!("dropped {}", meta.sig);
+                }
+            }
+        }
+    }
+}
+```
+
+In simple flows, storing only `Signature` is enough:
+
+```rust
+let txn_info = TpuSenderTxnInfo::new(signature);
+sender.send_txn(wire_txn, Some(txn_info)).await?;
+```
+
+## Compile-time metadata capacity (`TXN_INFO_CAP`)
+
+`TpuSenderTxnInfo` storage capacity is a compile-time constant generated by `build.rs`.
+
+- Fixed tiers: features `txn-info-cap-0`, `txn-info-cap-64` (default), `txn-info-cap-128`,
+  `txn-info-cap-192`
+- Any other size: feature `txn-info-cap-custom` plus env var `TXN_INFO_CAP` (`64` if unset, must
+  be greater than `0`). Without that feature, `build.rs` ignores `TXN_INFO_CAP`.
+- If several tiers end up enabled (Cargo unifies features across dependents), the largest wins.
+
+Set a custom size for a one-off build. Turn off default features, or the default
+`txn-info-cap-64` stays on alongside it:
+
+```sh
+TXN_INFO_CAP=100 cargo build -p yellowstone-jet-tpu-client \
+    --no-default-features --features yellowstone-grpc,simd-0296,txn-info-cap-custom
+```
+
+Run tests with a custom capacity. `--all-features` enables every tier, so the value only takes
+effect above `192`:
+
+```sh
+TXN_INFO_CAP=256 cargo test -p yellowstone-jet-tpu-client --all-features
+```
+
+You can verify the active compiled value in code:
+
+```rust
+use yellowstone_jet_tpu_client::TXN_INFO_CAP;
+
+println!("TXN_INFO_CAP={}", TXN_INFO_CAP);
+assert!(std::mem::size_of::<TxMeta>() <= TXN_INFO_CAP);
 ```
 
 

@@ -38,33 +38,36 @@
 //!
 //!
 
+include!(concat!(env!("OUT_DIR"), "/txn_info_cap.rs"));
+
 #[cfg(feature = "prometheus")]
 use crate::prom;
-#[allow(deprecated)]
-use solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS;
 use {
-    crate::config::{TpuOverrideInfo, TpuPortKind, TpuSenderConfig},
+    crate::{
+        config::{TpuOverrideInfo, TpuPortKind, TpuSenderConfig},
+        identity::TpuIdentity,
+    },
+    arc_swap::ArcSwap,
     bytes::Bytes,
+    core::fmt,
     derive_more::Display,
     futures::task::AtomicWaker,
     quinn::{
         ClientConfig, Connection, ConnectionError, Endpoint, IdleTimeout, TransportConfig, VarInt,
-        WriteError, crypto::rustls::QuicClientConfig,
+        WriteError,
     },
     rustls::{NamedGroup, crypto::CryptoProvider},
     solana_clock::DEFAULT_MS_PER_SLOT,
-    solana_keypair::Keypair,
     solana_pubkey::Pubkey,
-    solana_signature::Signature,
-    solana_signer::Signer,
-    solana_tls_utils::{QuicClientCertificate, SkipServerVerification, new_dummy_x509_certificate},
     std::{
+        any::TypeId,
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        future,
+        net::SocketAddr,
         num::NonZeroUsize,
         pin::Pin,
-        sync::{Arc, Mutex as StdMutex, atomic::AtomicBool},
-        task::Poll,
+        sync::{Arc, Mutex as StdMutex, atomic::AtomicU8},
+        task::{Poll, ready},
         time::{Duration, Instant},
     },
     tokio::{
@@ -76,32 +79,22 @@ use {
         task::{self, Id, JoinError, JoinHandle, JoinSet},
         time::{Sleep, interval},
     },
+    tokio_util::sync::PollSender,
 };
 
 /// This has been copy-pasted from `solana_streamer::nonblocking::quic::ALPN_TPU_PROTOCOL_ID`
 pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
+/// Solana's max transaction wire size. `1232` bytes per the original packet-size limit;
+/// `4096` under the `simd-0296` feature, once a target cluster has activated that SIMD
+/// raising the limit. See `accept_tx`'s size check, which rejects anything larger than
+/// this (unless `unsafe_allow_arbitrary_txn_size` is set).
+#[cfg(not(feature = "simd-0296"))]
 pub const PACKET_DATA_SIZE: usize = 1232;
 
-/// Largest SIMD-0385 v1 transaction; copied from `solana_message::v1::MAX_TRANSACTION_SIZE`.
-pub const V1_MAX_TRANSACTION_SIZE: usize = 4096;
-
-/// First wire byte of a v1 transaction; copied from `solana_message::v1::V1_PREFIX`.
-/// v1 writes its message, version byte first, ahead of the signatures, while legacy
-/// and v0 open with the short-vec signature count, which is always below `0x80`.
-const V1_TX_PREFIX: u8 = 0x81;
-
-///
-/// Wire-size ceiling for a serialized transaction: [`V1_MAX_TRANSACTION_SIZE`] for v1,
-/// [`PACKET_DATA_SIZE`] for legacy and v0. Agave's sanitizer caps each version the same
-/// way, and its TPU raises the per-stream byte limit to the v1 size.
-///
-pub fn max_wire_size(wire: &[u8]) -> usize {
-    match wire.first() {
-        Some(&V1_TX_PREFIX) => V1_MAX_TRANSACTION_SIZE,
-        _ => PACKET_DATA_SIZE,
-    }
-}
+/// See the `simd-0296`-disabled definition of `PACKET_DATA_SIZE` above.
+#[cfg(feature = "simd-0296")]
+pub const PACKET_DATA_SIZE: usize = 4096;
 
 pub const QUIC_SEND_FAIRNESS: bool = false;
 
@@ -146,6 +139,8 @@ pub(crate) struct SentOk {
     pub e2e_time: Duration,
 }
 
+const NUM_CONSECUTIVE_LEADER_SLOTS: u64 = 4;
+
 ///
 /// Metadata about an inflight connection attempt to a remote peer.
 ///
@@ -160,16 +155,44 @@ struct ConnectingMeta {
     created_at: Instant,
 }
 
+struct UpdateIdentityCallback {
+    shared: Option<Arc<UpdateIdentityInner>>,
+}
+
+impl Drop for UpdateIdentityCallback {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            shared.state.store(
+                UpdateIdentityInner::CANCELED,
+                std::sync::atomic::Ordering::Release,
+            );
+            shared.waker.wake();
+        }
+    }
+}
+
+impl UpdateIdentityCallback {
+    fn callback(mut self) {
+        if let Some(shared) = self.shared.take() {
+            shared.state.store(
+                UpdateIdentityInner::TRUE,
+                std::sync::atomic::Ordering::Release,
+            );
+            shared.waker.wake();
+        }
+    }
+}
+
 ///
 /// Inner part of the update identity command.
 ///
 struct UpdateIdentityCommand {
-    new_identity: Keypair,
-    callback: Arc<UpdateIdentityInner>,
+    new_identity: TpuIdentity,
+    callback: UpdateIdentityCallback,
 }
 
 struct MultiStepIdentitySynchronizationCommand {
-    new_identity: Keypair,
+    new_identity: TpuIdentity,
     barrier: Arc<Barrier>,
 }
 
@@ -177,8 +200,23 @@ struct MultiStepIdentitySynchronizationCommand {
 /// Command to control driver behavior.
 ///
 enum DriverCommand {
-    UpdateIdenttiy(UpdateIdentityCommand),
+    UpdateIdentity(UpdateIdentityCommand),
     MultiStepIdentitySynchronization(MultiStepIdentitySynchronizationCommand),
+}
+
+impl fmt::Debug for DriverCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DriverCommand::UpdateIdentity(cmd) => f
+                .debug_struct("UpdateIdentity")
+                .field("new_identity", &cmd.new_identity.pubkey())
+                .finish(),
+            DriverCommand::MultiStepIdentitySynchronization(cmd) => f
+                .debug_struct("MultiStepIdentitySynchronization")
+                .field("new_identity", &cmd.new_identity.pubkey())
+                .finish(),
+        }
+    }
 }
 
 enum DriverTaskMeta {
@@ -296,14 +334,16 @@ pub(crate) struct TpuSenderDriver<CB> {
     config: TpuSenderConfig,
 
     ///
-    /// Current certificate set
+    /// Current driver identity: public key plus its derived QUIC client TLS credentials.
     ///
-    client_certificate: Arc<QuicClientCertificate>,
+    identity: TpuIdentity,
 
     ///
-    /// Current set driver identity
+    /// The driver is the only writer of this cell; it's shared with [`TpuSenderIdentityUpdater`]
+    /// so callers can cheaply read the current identity's public key without round-tripping
+    /// through the command-and-control channel.
     ///
-    identity: Keypair,
+    current_identity_pubkey: Arc<ArcSwap<Pubkey>>,
 
     ///
     /// Transaction inlet channel : where transaction comes from.
@@ -390,7 +430,8 @@ struct OrphanConnectionSet {
 }
 
 impl OrphanConnectionSet {
-    fn len(&self) -> usize {
+    #[allow(dead_code)]
+    const fn len(&self) -> usize {
         self.curr_len
     }
 
@@ -594,36 +635,107 @@ where
             .or_else(|| self.other.get_quic_tpu_fwd_socket_addr(leader_pubkey))
     }
 }
+
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct TxnInfoStorage([u8; TXN_INFO_CAP]);
+
+#[derive(Clone, Copy)]
+pub struct TpuSenderTxnInfo {
+    inner: TxnInfoStorage,
+    type_id: TypeId,
+}
+
+impl fmt::Debug for TpuSenderTxnInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TpuSenderTxnInfo")
+            .field("type_id", &self.type_id)
+            .finish()
+    }
+}
+
+impl TpuSenderTxnInfo {
+    pub fn new<T: Sized + Copy + 'static>(val: T) -> Self {
+        assert!(
+            std::mem::size_of::<T>() <= TXN_INFO_CAP,
+            "TpuSenderTxnInfo can only hold up to {} bytes, but T is {} bytes",
+            TXN_INFO_CAP,
+            std::mem::size_of::<T>()
+        );
+        let mut storage = TxnInfoStorage([0u8; TXN_INFO_CAP]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (&val as *const T).cast::<u8>(),
+                storage.0.as_mut_ptr(),
+                std::mem::size_of::<T>(),
+            );
+        }
+        Self {
+            inner: storage,
+            type_id: TypeId::of::<T>(),
+        }
+    }
+
+    pub fn downcast_ref<T: Sized + Copy + 'static>(&self) -> Option<&T> {
+        let size = std::mem::size_of::<T>();
+        assert!(
+            size <= TXN_INFO_CAP,
+            "TpuSenderTxnInfo can only hold up to {} bytes, but T is {} bytes",
+            TXN_INFO_CAP,
+            size
+        );
+
+        if self.type_id != TypeId::of::<T>() {
+            return None;
+        }
+
+        let bytes = &self.inner.0;
+        let ptr = bytes.as_ptr();
+        let align = std::mem::align_of::<T>();
+        if !(ptr as usize).is_multiple_of(align) {
+            return None;
+        }
+
+        let value = unsafe { &*ptr.cast::<T>() };
+        Some(value)
+    }
+}
+
 ///
 /// A transaction with destination details to be sent to a remote peer.
 ///
 #[derive(Debug)]
 pub struct TpuSenderTxn {
-    /// Id set by the sender to identify the transaction. Only meaningful to the sender.
-    pub tx_sig: Signature,
     /// The wire format of the transaction.
     pub(crate) wire: Bytes,
     /// The pubkey of the remote peer to send the transaction to.
     pub remote_peer: Pubkey,
+    ///
+    /// Arbitrary information about the transaction. This can be used to store additional metadata or context about the transaction.
+    pub info: Option<TpuSenderTxnInfo>,
 }
 
 impl TpuSenderTxn {
-    pub fn from_bytes(tx_sig: Signature, remote_peer: Pubkey, wire: Bytes) -> Self {
+    pub const fn from_bytes(
+        remote_peer: Pubkey,
+        wire: Bytes,
+        info: Option<TpuSenderTxnInfo>,
+    ) -> Self {
         Self {
-            tx_sig,
             wire,
             remote_peer,
+            info,
         }
     }
 
-    pub fn from_owned<T>(tx_sig: Signature, remote_peer: Pubkey, wire: T) -> Self
+    pub fn from_owned<T>(remote_peer: Pubkey, wire: T, info: Option<TpuSenderTxnInfo>) -> Self
     where
         T: AsRef<[u8]> + Send + 'static,
     {
         Self {
-            tx_sig,
             wire: Bytes::from_owner(wire),
             remote_peer,
+            info,
         }
     }
 }
@@ -681,9 +793,8 @@ pub struct TxSent {
     ///
     pub remote_peer_addr: SocketAddr,
     ///
-    /// The transaction signature.
-    ///
-    pub tx_sig: Signature,
+    /// Arbitrary information about the transaction send attempt. This can be used to store additional metadata or context about the transaction.
+    pub info: Option<TpuSenderTxnInfo>,
 }
 
 ///
@@ -699,13 +810,13 @@ pub struct TxFailed {
     ///
     pub remote_peer_addr: SocketAddr,
     ///
-    /// The transaction signature.
-    ///
-    pub tx_sig: Signature,
-    ///
     /// Low-level reason for the failure.
     ///
     pub failure_reason: String,
+
+    ///
+    /// Arbitrary information about the transaction send attempt. This can be used to store additional metadata or context about the transaction.
+    pub info: Option<TpuSenderTxnInfo>,
 }
 
 ///
@@ -734,15 +845,28 @@ pub enum TxDropReason {
     #[display("remote peer is being evicted")]
     RemotePeerBeingEvicted,
     ///
-    /// The transaction is larger than [`max_wire_size`] allows for its version.
+    /// The transaction is invalid.
     ///
-    #[display("transaction exceeds its version's wire-size limit (1232 bytes, 4096 for v1)")]
+    #[display("transaction packet size exceeds PACKET_DATA_SIZE ({PACKET_DATA_SIZE} bytes)")]
     InvalidPacketSize,
     ///
     /// The remote peer identity changed.
     ///
     #[display("driver QUIC identity changed")]
     DriverIdentityChanged,
+}
+
+impl TxDropReason {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            TxDropReason::RateLimited => "rate-limited",
+            TxDropReason::RemotePeerUnreachable => "remote-peer-unreachable",
+            TxDropReason::DropByDriver => "drop-by-driver",
+            TxDropReason::RemotePeerBeingEvicted => "remote-conn-peer-being-evicted",
+            TxDropReason::InvalidPacketSize => "invalid-packet-size",
+            TxDropReason::DriverIdentityChanged => "quic-driver-identity-changed",
+        }
+    }
 }
 
 ///
@@ -781,7 +905,7 @@ pub enum TpuSenderResponse {
 ///
 struct ConnectingTask {
     remote_peer_identity: Pubkey,
-    cert: Arc<QuicClientCertificate>,
+    identity: TpuIdentity,
     max_idle_timeout: Duration,
     connection_timeout: Duration,
     wait_for_eviction: Option<Arc<Notify>>,
@@ -822,19 +946,6 @@ impl ConnectingTask {
             );
         }
 
-        let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("Failed to set QUIC client protocol versions")
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_client_auth_cert(
-                vec![self.cert.certificate.clone()],
-                self.cert.key.clone_key(),
-            )
-            .expect("Failed to set QUIC client certificates");
-        crypto.enable_early_data = true;
-        crypto.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
-
         let transport_config = {
             let mut res = TransportConfig::default();
 
@@ -850,7 +961,7 @@ impl ConnectingTask {
             res
         };
 
-        let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
+        let mut config = ClientConfig::new(Arc::new(self.identity.insecure_clone()));
         config.transport_config(Arc::new(transport_config));
 
         let server_name = socket_addr_to_quic_server_name(remote_peer_addr);
@@ -942,7 +1053,7 @@ where
     ) -> Option<TxSenderWorkerError> {
         let result = self.send_tx(tx.wire.as_ref()).await;
         let remote_addr = self.remote_peer_addr;
-        let tx_sig = tx.tx_sig;
+        let tx_info = tx.info;
         match result {
             Ok(sent_ok) => {
                 tracing::debug!(
@@ -953,7 +1064,7 @@ where
                 let resp = TxSent {
                     remote_peer_identity: self.remote_peer,
                     remote_peer_addr: remote_addr,
-                    tx_sig,
+                    info: tx_info,
                 };
                 if let Some(callback) = &self.output_tx {
                     callback.call(TpuSenderResponse::TxSent(resp));
@@ -993,15 +1104,14 @@ where
                         remote_peer_identity: self.remote_peer,
                         remote_peer_addr: self.remote_peer_addr,
                         failure_reason: e.to_string(),
-                        tx_sig,
+                        info: tx_info,
                     };
                     if let Some(callback) = &self.output_tx {
                         callback.call(TpuSenderResponse::TxFailed(resp));
                     }
                 } else {
                     tracing::trace!(
-                        "Retrying to send transaction: {} to remote peer: {} after {} attempts: {:?}",
-                        tx_sig,
+                        "Retrying to send transaction to remote peer: {} after {} attempts: {:?}",
                         self.remote_peer,
                         attempt,
                         e
@@ -1015,18 +1125,13 @@ where
                     }
                     SendTxError::StreamStopped(_) | SendTxError::StreamClosed => {
                         tracing::trace!(
-                            "Stream stopped or closed for tx: {} to remote peer: {}",
-                            tx_sig,
+                            "Stream stopped or closed to remote peer: {}",
                             self.remote_peer
                         );
                         None
                     }
                     SendTxError::ZeroRttRejected => {
-                        tracing::warn!(
-                            "0-RTT rejected by remote peer: {} for tx: {}",
-                            self.remote_peer,
-                            tx_sig
-                        );
+                        tracing::warn!("0-RTT rejected by remote peer: {}", self.remote_peer);
                         Some(TxSenderWorkerError::ZeroRttRejected)
                     }
                 }
@@ -1036,12 +1141,6 @@ where
 
     async fn try_process_tx_in_queue(&mut self) -> Option<TxSenderWorkerError> {
         while let Some((tx, attempt)) = self.tx_queue.pop_front() {
-            tracing::trace!(
-                "Processing tx: {} for remote peer: {} with attempt: {}",
-                tx.tx_sig,
-                self.remote_peer,
-                attempt
-            );
             if let Some(e) = self.process_tx(tx, attempt).await {
                 return Some(e);
             }
@@ -1073,7 +1172,6 @@ where
                     match maybe {
                         Some(tx) => {
                             last_activity = Instant::now();
-                            tracing::trace!("Received tx: {} for remote peer: {}", tx.tx_sig, self.remote_peer);
                             self.tx_queue.push_back((tx, 1));
                         }
                         None => {
@@ -1669,7 +1767,7 @@ where
                     prom::incr_quic_gw_tx_connection_cache_miss_cnt();
                 }
             }
-            tracing::warn!(
+            tracing::debug!(
                 "Skipping connection attempt to remote peer: {} since it is already connecting",
                 remote_peer_identity
             );
@@ -1677,7 +1775,7 @@ where
         }
 
         if self.being_evicted_peers.contains(&remote_peer_identity) {
-            tracing::warn!(
+            tracing::debug!(
                 "Skipping connection attempt to remote peer: {} since it is being evicted",
                 remote_peer_identity
             );
@@ -1688,7 +1786,7 @@ where
             .tx_worker_handle_map
             .contains_key(&remote_peer_identity)
         {
-            tracing::warn!(
+            tracing::debug!(
                 "Skipping connection attempt to remote peer: {} since it already has a worker",
                 remote_peer_identity
             );
@@ -1791,11 +1889,11 @@ where
             None => {
                 // No existing connecting task for the remote peer address, spawn a new one.
                 let endpoint_idx = self.next_endpoint_idx();
-                let cert = Arc::clone(&self.client_certificate);
+                let identity = self.identity.insecure_clone();
                 let max_idle_timeout = self.config.max_idle_timeout;
                 let fut = ConnectingTask {
                     remote_peer_identity,
-                    cert,
+                    identity,
                     max_idle_timeout,
                     connection_timeout: self.config.connecting_timeout,
                     wait_for_eviction: maybe_wait_for_eviction,
@@ -2165,7 +2263,7 @@ where
                                 // EACH REATTEMPT SPAWNS A NEW CONNECTING TASK WITH ATTEMPT COUNT EQUALS TO PREVIOUS ATTEMPT COUNT + 1.
                                 // AFTER REACHING MAX ATTEMPTS, THE DEFAULT MATCH BRANCH WILL HANDLE THE FAILURE CALLED "whatever".
 
-                                tracing::warn!(
+                                tracing::info!(
                                     "Connection attempt {} to remote peer: {multiplexed_remote_peer_identity_vec:?} failed, retrying...",
                                     connection_attempt
                                 );
@@ -2254,7 +2352,7 @@ where
     /// So we use connection versioning to `assert!` that we didn't create any orphan worker or orphan connection in the code.
     ///
     ///
-    fn next_connection_version(&mut self) -> u64 {
+    const fn next_connection_version(&mut self) -> u64 {
         let ret = self.connection_version;
         self.connection_version += 1;
         ret
@@ -2263,7 +2361,7 @@ where
     ///
     /// Round-robin endpoint selection
     ///
-    fn next_endpoint_idx(&mut self) -> usize {
+    const fn next_endpoint_idx(&mut self) -> usize {
         let ret = self.endpoint_sequence;
         self.endpoint_sequence = (self.endpoint_sequence + 1) % self.endpoints.len();
         ret
@@ -2279,10 +2377,9 @@ where
         let remote_peer_identity = tx.remote_peer;
         self.last_peer_activity
             .insert(remote_peer_identity, Instant::now());
-        let tx_id = tx.tx_sig;
 
         // Check size
-        if tx.wire.len() > max_wire_size(&tx.wire) && !self.config.unsafe_allow_arbitrary_txn_size {
+        if tx.wire.len() > PACKET_DATA_SIZE && !self.config.unsafe_allow_arbitrary_txn_size {
             let tx_drop = TxDrop {
                 remote_peer_identity,
                 drop_reason: TxDropReason::InvalidPacketSize,
@@ -2308,7 +2405,6 @@ where
             }
             match handle.sender.try_send(tx) {
                 Ok(_) => {
-                    tracing::trace!("{tx_id} sent to worker");
                     #[cfg(feature = "prometheus")]
                     {
                         prom::incr_quic_gw_tx_relayed_to_worker(remote_peer_identity);
@@ -2317,9 +2413,8 @@ where
                 Err(e) => match e {
                     mpsc::error::TrySendError::Full(tx) => {
                         tracing::warn!(
-                            "Remote peer: {:?} tx queue is full, dropping tx: {:?}",
+                            "Remote peer: {:?} tx queue is full, dropping tx",
                             remote_peer_identity,
-                            tx_id
                         );
                         let txdrop = TxDrop {
                             remote_peer_identity,
@@ -2335,7 +2430,6 @@ where
                         }
                     }
                     mpsc::error::TrySendError::Closed(tx) => {
-                        tracing::debug!("Enqueuing tx: {tx_id:.10}",);
                         self.tx_queues
                             .entry(remote_peer_identity)
                             .or_default()
@@ -2354,7 +2448,7 @@ where
                 .entry(remote_peer_identity)
                 .or_default()
                 .push_back((tx, 1));
-            tracing::trace!("queuing tx: {:?}", tx_id);
+            tracing::trace!("queuing tx for remote peer: {:?}", remote_peer_identity);
 
             // Check if we are not already connecting to this remote peer.
             // If the remote peer is already being connected, just queue the tx.
@@ -2613,7 +2707,7 @@ where
                         while let Ok(tx) = worker_completed.rx.try_recv() {
                             canceled_txn.push_back((tx, 1));
                         }
-                        canceled_txn.extend(worker_completed.pending_tx.into_iter());
+                        canceled_txn.extend(worker_completed.pending_tx);
                         canceled_txn
                     }
                     Err(_) => VecDeque::new(),
@@ -2665,7 +2759,7 @@ where
     /// 8. Replay all connecting tasks with the new identity and connecting meta stored at step #3.
     ///  
     ///
-    async fn update_identity(&mut self, new_identity: Keypair, barrier_like: impl Future) {
+    async fn update_identity(&mut self, new_identity: TpuIdentity, barrier_like: impl Future) {
         self.schedule_graceful_drop_all_worker();
         self.connection_map.clear();
         self.orphan_connection_set.clear();
@@ -2681,15 +2775,9 @@ where
 
         let connecting_meta = std::mem::take(&mut self.connecting_meta);
 
-        // Update identity
-        let (certificate, privkey) = new_dummy_x509_certificate(&new_identity);
-        let cert = Arc::new(QuicClientCertificate {
-            certificate,
-            key: privkey,
-        });
-
-        self.client_certificate = cert;
         self.identity = new_identity;
+        self.current_identity_pubkey
+            .store(Arc::new(self.identity.pubkey()));
         #[cfg(feature = "prometheus")]
         {
             prom::quic_set_identity(self.identity.pubkey());
@@ -2724,16 +2812,13 @@ where
 
     async fn handle_cnc(&mut self, command: DriverCommand) {
         match command {
-            DriverCommand::UpdateIdenttiy(cmd) => {
+            DriverCommand::UpdateIdentity(cmd) => {
                 let UpdateIdentityCommand {
                     new_identity,
                     callback,
                 } = cmd;
                 let fake_barrier = async {
-                    callback
-                        .set
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    callback.waker.wake();
+                    callback.callback();
                 };
                 self.update_identity(new_identity, fake_barrier).await;
             }
@@ -2894,10 +2979,7 @@ where
 
     fn try_evict_orphan_connections(&mut self) {
         let now = Instant::now();
-        loop {
-            let Some(oldest) = self.orphan_connection_set.oldest() else {
-                break;
-            };
+        while let Some(oldest) = self.orphan_connection_set.oldest() {
             if oldest + self.config.orphan_connection_ttl > now {
                 break;
             }
@@ -2945,6 +3027,7 @@ where
         }
     }
 
+    #[allow(unused_variables)]
     pub async fn run(mut self) {
         #[cfg(feature = "prometheus")]
         {
@@ -3249,6 +3332,17 @@ pub trait TpuSenderResponseCallback: Clone + Send + Sync + 'static {
     fn call(&self, response: TpuSenderResponse);
 }
 
+impl<T> TpuSenderResponseCallback for Option<T>
+where
+    T: TpuSenderResponseCallback,
+{
+    fn call(&self, response: TpuSenderResponse) {
+        if let Some(callback) = self {
+            callback.call(response);
+        }
+    }
+}
+
 ///
 /// A no-op implementation of [`TpuSenderResponseCallback`].
 ///
@@ -3276,7 +3370,7 @@ pub struct TpuSenderDriverSpawner {
 impl TpuSenderDriverSpawner {
     pub fn spawn_default_with_callback<CB>(
         &self,
-        identity: Keypair,
+        identity: TpuIdentity,
         callback_sink: CB,
     ) -> TpuSenderSessionContext
     where
@@ -3291,7 +3385,7 @@ impl TpuSenderDriverSpawner {
         )
     }
 
-    pub fn spawn_with_default(&self, identity: Keypair) -> TpuSenderSessionContext {
+    pub fn spawn_with_default(&self, identity: TpuIdentity) -> TpuSenderSessionContext {
         self.spawn::<Nothing>(
             identity,
             Default::default(),
@@ -3303,7 +3397,7 @@ impl TpuSenderDriverSpawner {
 
     pub fn spawn<CB>(
         &self,
-        identity: Keypair,
+        identity: TpuIdentity,
         config: TpuSenderConfig,
         eviction_strategy: Arc<dyn ConnectionEvictionStrategy + Send + Sync + 'static>,
         leader_schedule: Arc<dyn UpcomingLeaderPredictor + Send + Sync + 'static>,
@@ -3324,7 +3418,7 @@ impl TpuSenderDriverSpawner {
 
     pub fn spawn_on<CB>(
         &self,
-        identity: Keypair,
+        identity: TpuIdentity,
         config: TpuSenderConfig,
         eviction_strategy: Arc<dyn ConnectionEvictionStrategy + Send + Sync + 'static>,
         leader_predictor: Arc<dyn UpcomingLeaderPredictor + Send + Sync + 'static>,
@@ -3352,21 +3446,14 @@ impl TpuSenderDriverSpawner {
         let (tx_inlet, tx_outlet) = mpsc::channel(self.driver_tx_channel_capacity);
         let (driver_cnc_tx, driver_cnc_rx) = mpsc::channel(10);
 
-        let (certificate, private_key) = new_dummy_x509_certificate(&identity);
-        let cert = Arc::new(QuicClientCertificate {
-            certificate,
-            key: private_key,
-        });
-
+        let bind_addr = config.endpoint_bind_addr;
         let mut endpoints = vec![];
         for _ in 0..config.num_endpoints.get() {
             let endpoint = (0..config.max_local_port_binding_attempts)
                 .find_map(|_| {
-                    let (_, client_socket) = solana_net_utils::bind_in_range(
-                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                        config.endpoint_port_range,
-                    )
-                    .ok()?;
+                    let (_, client_socket) =
+                        solana_net_utils::bind_in_range(bind_addr, config.endpoint_port_range)
+                            .ok()?;
                     Endpoint::new(
                         quinn::EndpointConfig::default(),
                         None,
@@ -3375,7 +3462,15 @@ impl TpuSenderDriverSpawner {
                     )
                     .ok()
                 })
-                .expect("Failed to create QUIC endpoint");
+                .unwrap_or_else(|| {
+                    // A non-wildcard bind address that is not configured on the host fails here
+                    // with EADDRNOTAVAIL. Abort rather than fall back to the wildcard, which
+                    // would silently source traffic from the host's primary address.
+                    panic!(
+                        "Failed to create QUIC endpoint bound to {bind_addr} in port range {:?} after {} attempts",
+                        config.endpoint_port_range, config.max_local_port_binding_attempts,
+                    )
+                });
 
             endpoints.push(endpoint);
         }
@@ -3385,6 +3480,7 @@ impl TpuSenderDriverSpawner {
             config.tpu_port,
             Arc::clone(&self.leader_tpu_info_service),
         );
+        let current_identity_pubkey = Arc::new(ArcSwap::new(Arc::new(identity.pubkey())));
         let driver = TpuSenderDriver {
             stake_info_map: Arc::clone(&self.stake_info_map),
             tx_worker_handle_map: Default::default(),
@@ -3393,12 +3489,12 @@ impl TpuSenderDriverSpawner {
             active_staked_sorted_remote_peer: Default::default(),
             tx_queues: Default::default(),
             identity,
+            current_identity_pubkey: Arc::clone(&current_identity_pubkey),
             connecting_tasks: JoinSet::new(),
             connecting_meta: Default::default(),
             connecting_remote_peers: Default::default(),
             leader_tpu_info_service: Arc::clone(&self.leader_tpu_info_service),
             config,
-            client_certificate: cert,
             tx_inlet: tx_outlet,
             response_outlet: response_callback.clone(),
             cnc_rx: driver_cnc_rx,
@@ -3426,7 +3522,8 @@ impl TpuSenderDriverSpawner {
         TpuSenderSessionContext {
             driver_tx_sink: tx_inlet,
             identity_updater: TpuSenderIdentityUpdater {
-                cnc_tx: driver_cnc_tx,
+                cnc_tx: PollSender::new(driver_cnc_tx),
+                current_identity_pubkey,
             },
             driver_join_handle: jh,
         }
@@ -3436,11 +3533,18 @@ impl TpuSenderDriverSpawner {
 ///
 /// Handle to update the identity used by the TPU sender driver.
 ///
+#[derive(Clone)]
 pub struct TpuSenderIdentityUpdater {
     ///
     /// Command-and-control channel to send command to the QUIC driver
-    ///  
-    cnc_tx: mpsc::Sender<DriverCommand>,
+    ///
+    cnc_tx: PollSender<DriverCommand>,
+
+    ///
+    /// Read-only handle onto the driver's current identity public key. The driver is the only
+    /// writer; see [`TpuSenderIdentityUpdater::current_identity`].
+    ///
+    current_identity_pubkey: Arc<ArcSwap<Pubkey>>,
 }
 
 ///
@@ -3448,27 +3552,39 @@ pub struct TpuSenderIdentityUpdater {
 ///
 impl TpuSenderIdentityUpdater {
     ///
+    /// Returns the driver's current identity public key.
+    ///
+    /// This reads a shared, lock-free cell the driver updates whenever its identity changes --
+    /// it does not round-trip through the command-and-control channel, so it reflects whatever
+    /// the driver has *applied* so far, not necessarily an in-flight [`Self::update_identity`]
+    /// that hasn't completed yet.
+    ///
+    pub fn current_identity(&self) -> Pubkey {
+        *self.current_identity_pubkey.load_full()
+    }
+
+    ///
     /// Changes the configured identity in the QUIC driver
     ///
-    pub async fn update_identity(&mut self, identity: Keypair) {
+    pub fn update_identity(&mut self, identity: TpuIdentity) -> UpdateIdentity {
         let shared = UpdateIdentityInner {
-            set: AtomicBool::new(false),
+            state: AtomicU8::new(UpdateIdentityInner::FALSE),
             waker: AtomicWaker::new(),
         };
         let shared = Arc::new(shared);
+        let callback = UpdateIdentityCallback {
+            shared: Some(Arc::clone(&shared)),
+        };
         let cmd = UpdateIdentityCommand {
             new_identity: identity,
-            callback: Arc::clone(&shared),
+            callback,
         };
-        self.cnc_tx
-            .send(DriverCommand::UpdateIdenttiy(cmd))
-            .await
-            .expect("disconnected");
-        let update_identity = UpdateIdentity {
+        let cnc_tx = self.cnc_tx.clone();
+
+        UpdateIdentity {
             inner: shared,
-            _this: self,
-        };
-        update_identity.await
+            state: UpdateIdentityState::Init { cnc_tx, cmd },
+        }
     }
 
     ///
@@ -3483,17 +3599,34 @@ impl TpuSenderIdentityUpdater {
     ///
     pub async fn update_identity_with_confirmation_barrier(
         &self,
-        identity: Keypair,
+        identity: TpuIdentity,
         barrier: Arc<Barrier>,
     ) {
         let cmd = MultiStepIdentitySynchronizationCommand {
             new_identity: identity,
             barrier,
         };
-        self.cnc_tx
-            .send(DriverCommand::MultiStepIdentitySynchronization(cmd))
+        let mut cnc_tx = self.cnc_tx.clone();
+        future::poll_fn(|cx| cnc_tx.poll_reserve(cx))
             .await
             .expect("disconnected");
+        cnc_tx
+            .send_item(DriverCommand::MultiStepIdentitySynchronization(cmd))
+            .expect("disconnected");
+    }
+
+    ///
+    /// Builds a [`TpuSenderIdentityUpdater`] backed by an already-closed channel, for use in
+    /// tests that only need a placeholder value (e.g. to construct a [`TpuSender`](crate::sender::TpuSender))
+    /// and don't exercise identity updates.
+    ///
+    #[cfg(test)]
+    pub(crate) fn new_test_disconnected() -> Self {
+        let (cnc_tx, _cnc_rx) = tokio::sync::mpsc::channel(1);
+        Self {
+            cnc_tx: PollSender::new(cnc_tx),
+            current_identity_pubkey: Arc::new(ArcSwap::new(Arc::new(Pubkey::default()))),
+        }
     }
 }
 
@@ -3501,37 +3634,105 @@ impl TpuSenderIdentityUpdater {
 /// The shared state used to notify the completion of the identity update.
 /// See [`UpdateIdentity`] for more details.
 struct UpdateIdentityInner {
-    set: AtomicBool,
+    state: AtomicU8,
     waker: AtomicWaker,
+}
+
+// impl Drop for UpdateIdentityInner {
+//     fn drop(&mut self) {
+//         // If the future is dropped before the identity update is completed, we need to notify the driver to cancel the update.
+//         let last_state = self.state.load(std::sync::atomic::Ordering::Acquire);
+//         if last_state == UpdateIdentityInner::TRUE || last_state == UpdateIdentityInner::CANCELED_FLAG {
+//             // The update has already completed or been canceled, no need to do anything.
+//             return;
+//         }
+//         self.state
+//             .store(UpdateIdentityInner::CANCELED_FLAG, std::sync::atomic::Ordering::SeqCst);
+//         self.waker.wake();
+//     }
+// }
+
+impl UpdateIdentityInner {
+    const FALSE: u8 = 0;
+    const TRUE: u8 = 1;
+    // the last bit is used to indicate that the update has been canceled, and the future should return an error.
+    const CANCELED: u8 = 0x80;
+}
+
+#[allow(clippy::large_enum_variant)]
+enum UpdateIdentityState {
+    Init {
+        cnc_tx: PollSender<DriverCommand>,
+        cmd: UpdateIdentityCommand,
+    },
+    Closed,
+    WaitingForCompletion,
 }
 
 ///
 /// Future that waits for the identity update to complete.
 /// This future is used to ensure that the identity update is completed before proceeding.
 ///
-pub struct UpdateIdentity<'a> {
+pub struct UpdateIdentity {
     inner: Arc<UpdateIdentityInner>,
-    _this: &'a TpuSenderIdentityUpdater, /* phantom data to prevent two threads from updating the identity at the same time */
+    state: UpdateIdentityState,
 }
 
-impl Future for UpdateIdentity<'_> {
-    type Output = ();
+impl UpdateIdentity {
+    const fn take_state(&mut self) -> UpdateIdentityState {
+        std::mem::replace(&mut self.state, UpdateIdentityState::Closed)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("tpu sender runtime closed")]
+pub struct UpdateIdentityError;
+
+impl Future for UpdateIdentity {
+    type Output = Result<(), UpdateIdentityError>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // quick check to avoid registration if already done.
-        if self.inner.set.load(std::sync::atomic::Ordering::Relaxed) {
-            return Poll::Ready(());
-        }
+        let this = self.get_mut();
 
-        self.inner.waker.register(cx.waker());
+        let (result, next_state) = match this.take_state() {
+            UpdateIdentityState::Init { mut cnc_tx, cmd } => {
+                match ready!(cnc_tx.poll_reserve(cx)) {
+                    Ok(()) => {
+                        match cnc_tx.send_item(DriverCommand::UpdateIdentity(cmd)) {
+                            Ok(()) => {
+                                this.inner.waker.register(cx.waker());
+                                // Between the time we send and the registration, the driver may have already completed the update and set the atomic bool.
+                                // So we need to immediately wake the waker, so that the next poll will check the atomic bool and return ready if the update is already complete.
+                                cx.waker().wake_by_ref();
+                                (None, UpdateIdentityState::WaitingForCompletion)
+                            }
+                            Err(_) => (Some(Err(UpdateIdentityError)), UpdateIdentityState::Closed),
+                        }
+                    }
+                    Err(_) => (Some(Err(UpdateIdentityError)), UpdateIdentityState::Closed),
+                }
+            }
+            UpdateIdentityState::WaitingForCompletion => {
+                match this.inner.state.load(std::sync::atomic::Ordering::Relaxed) {
+                    UpdateIdentityInner::TRUE => (Some(Ok(())), UpdateIdentityState::Closed),
+                    UpdateIdentityInner::FALSE => (None, UpdateIdentityState::WaitingForCompletion),
+                    UpdateIdentityInner::CANCELED => {
+                        (Some(Err(UpdateIdentityError)), UpdateIdentityState::Closed)
+                    }
+                    _ => panic!("Unexpected state"),
+                }
+            }
+            UpdateIdentityState::Closed => {
+                panic!("UpdateIdentity polled after completion");
+            }
+        };
 
-        // Need to check condition **after** `register` to avoid a race
-        // condition that would result in lost notifications.
-        if self.inner.set.load(std::sync::atomic::Ordering::Relaxed) {
-            Poll::Ready(())
+        this.state = next_state;
+        if let Some(result) = result {
+            Poll::Ready(result)
         } else {
             Poll::Pending
         }
@@ -3548,19 +3749,43 @@ mod test {
         super::{
             DriverCommand, StakeSortedPeerSet, TpuSenderIdentityUpdater, UpdateIdentityCommand,
         },
+        crate::identity::TpuIdentity,
+        arc_swap::ArcSwap,
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
-        std::time::Duration,
+        std::{sync::Arc, time::Duration},
         tokio::sync::mpsc,
+        tokio_util::sync::PollSender,
     };
+
+    #[tokio::test]
+    async fn update_identity_should_return_error_if_dropped_before_completion() {
+        let (cnc_tx, cnc_rx) = mpsc::channel(10);
+        let mut updater: TpuSenderIdentityUpdater = TpuSenderIdentityUpdater {
+            cnc_tx: PollSender::new(cnc_tx),
+            current_identity_pubkey: Arc::new(ArcSwap::new(Arc::new(Pubkey::default()))),
+        };
+
+        let identity = TpuIdentity::from_keypair(&Keypair::new());
+        let mut update_fut = updater.update_identity(identity.insecure_clone());
+        let xs = futures::poll!(&mut update_fut);
+        assert!(xs.is_pending());
+        drop(updater);
+        drop(cnc_rx);
+        let result = update_fut.await;
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn test_update_identity_fut() {
         let (cnc_tx, mut cnc_rx) = mpsc::channel(10);
-        let mut updater = TpuSenderIdentityUpdater { cnc_tx };
+        let mut updater = TpuSenderIdentityUpdater {
+            cnc_tx: PollSender::new(cnc_tx),
+            current_identity_pubkey: Arc::new(ArcSwap::new(Arc::new(Pubkey::default()))),
+        };
 
         let jh = tokio::spawn(async move {
-            let DriverCommand::UpdateIdenttiy(UpdateIdentityCommand {
+            let DriverCommand::UpdateIdentity(UpdateIdentityCommand {
                 new_identity,
                 callback,
             }) = cnc_rx.recv().await.unwrap()
@@ -3569,18 +3794,18 @@ mod test {
             };
             tokio::time::sleep(Duration::from_secs(2)).await;
             // This can be relaxed because `wake` hides `Released` memory barrier.
-            callback
-                .set
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            callback.waker.wake();
+            callback.callback();
             new_identity
         });
 
-        let identity = Keypair::new();
-        updater.update_identity(identity.insecure_clone()).await;
+        let identity = TpuIdentity::from_keypair(&Keypair::new());
+        updater
+            .update_identity(identity.insecure_clone())
+            .await
+            .unwrap();
 
         let actual = jh.await.unwrap();
-        assert_eq!(actual, identity)
+        assert_eq!(actual.pubkey(), identity.pubkey())
     }
 
     #[test]
@@ -4090,5 +4315,26 @@ mod leader_tpu_info_service_test {
         let actual_normal = override_svc.get_quic_dest_addr(&pk1, TpuPortKind::Normal);
         assert_eq!(actual_normal, Some("127.0.0.1:8000".parse().unwrap()));
         assert_eq!(actual_fwd, Some("127.0.0.1:8001".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod test_tpu_sender_txn_info {
+    use crate::core::TpuSenderTxnInfo;
+
+    #[test]
+    fn test_txn_info() {
+        #[derive(Debug, Clone, PartialEq, Eq, Copy)]
+        struct TestTxnInfo {
+            data: [u8; 4],
+        }
+
+        let expected = TestTxnInfo {
+            data: [0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let info = TpuSenderTxnInfo::new(expected);
+
+        let actual = info.downcast_ref::<TestTxnInfo>().copied().unwrap();
+        assert_eq!(actual, expected);
     }
 }

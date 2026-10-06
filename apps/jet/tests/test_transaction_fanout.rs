@@ -1,6 +1,7 @@
 mod testkit;
 
 use {
+    futures::{StreamExt, channel::mpsc},
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_message::{VersionedMessage, v0},
@@ -9,18 +10,18 @@ use {
     solana_system_interface::instruction::transfer,
     solana_transaction::versioned::VersionedTransaction,
     std::{
+        mem::MaybeUninit,
         sync::{Arc, RwLock as StdRwLock},
         vec,
     },
-    tokio::sync::mpsc,
     yellowstone_jet::transactions::{
-        AlwaysAllowTransactionPolicyStore, FanoutConfig, QuicGatewayBidi, SendTransactionRequest,
+        AlwaysAllowTransactionPolicyStore, FanoutConfig, JetTxnInfo, SendTransactionRequest,
         TransactionFanout, TransactionPolicyStore, UpcomingLeaderSchedule,
     },
     yellowstone_shield_store::CheckError,
 };
 
-pub fn create_send_transaction_request(hash: Hash, max_resent: usize) -> SendTransactionRequest {
+pub fn create_send_transaction_request(hash: Hash) -> SendTransactionRequest {
     let fake_wallet_keypair1 = Keypair::new();
     let fake_wallet_keypair2 = Keypair::new();
     let instructions = vec![transfer(
@@ -38,14 +39,17 @@ pub fn create_send_transaction_request(hash: Hash, max_resent: usize) -> SendTra
     )
     .expect("try new");
 
-    let wire_transaction = bincode::serialize(&tx).expect("Error getting wire_transaction");
-
+    let wire_transaction = wincode::serialize(&tx).expect("Error getting wire_transaction");
+    let signer = tx.message.static_account_keys()[0];
     SendTransactionRequest {
-        max_retries: Some(max_resent),
         signature: tx.signatures[0],
         wire_transaction: wire_transaction.into(),
-        transaction: tx,
         policies: vec![],
+        x_request_id: None,
+        durable_nonce: None,
+        recent_blockhash: hash,
+        x_subscription_id: None,
+        signer,
     }
 }
 
@@ -62,9 +66,22 @@ impl FakeLeaderSchedule {
 }
 
 impl UpcomingLeaderSchedule for FakeLeaderSchedule {
-    fn leader_lookahead(&self, leader_forward_lookahead: usize) -> Vec<Pubkey> {
+    fn leader_lookahead(
+        &self,
+        leader_forward_lookahead: usize,
+        out: &mut [MaybeUninit<Pubkey>],
+    ) -> usize {
         let schedule = self.share.read().unwrap();
-        schedule[..leader_forward_lookahead].to_vec()
+
+        let it = schedule[..leader_forward_lookahead]
+            .iter()
+            .zip(out.iter_mut());
+        let mut i = 0;
+        for (src, dst) in it {
+            dst.write(*src);
+            i += 1;
+        }
+        i
     }
     fn get_current_slot(&self) -> solana_clock::Slot {
         // For testing purposes, we can return a dummy slot.
@@ -76,13 +93,8 @@ impl UpcomingLeaderSchedule for FakeLeaderSchedule {
 #[tokio::test]
 async fn it_should_fanout_three_times() {
     const FANOUT_FACTOR: usize = 3;
-    let (sink, source) = mpsc::unbounded_channel();
+    let (sink, source) = mpsc::unbounded();
     let (gateway_tx, mut gateway_rx) = mpsc::channel(100);
-    let (_gateway_response_tx, gateway_response_rx) = mpsc::unbounded_channel();
-    let gateway_bidi = QuicGatewayBidi {
-        sink: gateway_tx,
-        source: gateway_response_rx,
-    };
     let fake_schedule = FakeLeaderSchedule::default();
 
     let my_schedule = vec![
@@ -95,26 +107,31 @@ async fn it_should_fanout_three_times() {
 
     #[allow(deprecated)]
     let mut fanout = TransactionFanout::new(
-        Arc::new(fake_schedule),
-        Arc::new(AlwaysAllowTransactionPolicyStore),
+        fake_schedule,
+        AlwaysAllowTransactionPolicyStore,
         source,
-        gateway_bidi,
+        gateway_tx,
         FanoutConfig::Custom(FANOUT_FACTOR),
         Vec::new(),
-        None,
     );
     let _fanout_jh = tokio::spawn(async move {
         fanout.run().await;
     });
 
-    let tx = create_send_transaction_request(Hash::new_unique(), 0);
-    let tx = Arc::new(tx);
-    sink.send(Arc::clone(&tx)).unwrap();
+    let tx = create_send_transaction_request(Hash::new_unique());
+    sink.unbounded_send(tx.clone()).unwrap();
 
     let mut actual_tx_sent = vec![];
     for pubkey in my_schedule.iter().take(FANOUT_FACTOR) {
-        let actual_tx = gateway_rx.recv().await.unwrap();
-        assert_eq!(actual_tx.tx_sig, actual_tx.tx_sig);
+        let actual_tx = gateway_rx.next().await.unwrap();
+        assert_eq!(
+            actual_tx
+                .info
+                .as_ref()
+                .and_then(|info| info.downcast_ref::<JetTxnInfo>())
+                .map(|info| info.signature),
+            Some(tx.signature)
+        );
         assert_eq!(actual_tx.remote_peer, *pubkey);
         actual_tx_sent.push(actual_tx);
     }
@@ -124,13 +141,8 @@ async fn it_should_fanout_three_times() {
 #[tokio::test]
 async fn it_should_apply_shield_policies() {
     const FANOUT_FACTOR: usize = 3;
-    let (sink, source) = mpsc::unbounded_channel();
+    let (sink, source) = mpsc::unbounded();
     let (gateway_tx, mut gateway_rx) = mpsc::channel(100);
-    let (_gateway_response_tx, gateway_response_rx) = mpsc::unbounded_channel();
-    let gateway_bidi = QuicGatewayBidi {
-        sink: gateway_tx,
-        source: gateway_response_rx,
-    };
     let fake_schedule = FakeLeaderSchedule::default();
 
     let my_schedule = vec![
@@ -156,37 +168,105 @@ async fn it_should_apply_shield_policies() {
 
     #[allow(deprecated)]
     let mut fanout = TransactionFanout::new(
-        Arc::new(fake_schedule),
-        Arc::new(policy),
+        fake_schedule,
+        policy,
         source,
-        gateway_bidi,
+        gateway_tx,
         FanoutConfig::Custom(FANOUT_FACTOR),
         Vec::new(),
-        None,
     );
     let _fanout_jh = tokio::spawn(async move {
         fanout.run().await;
     });
 
-    let tx = create_send_transaction_request(Hash::new_unique(), 0);
-    let tx = Arc::new(tx);
-    sink.send(Arc::clone(&tx)).unwrap();
-    let actual_tx = gateway_rx.recv().await.unwrap();
+    let tx = create_send_transaction_request(Hash::new_unique());
+    sink.unbounded_send(tx.clone()).unwrap();
+    let actual_tx = gateway_rx.next().await.unwrap();
     assert!(gateway_rx.try_recv().is_err());
-    assert_eq!(actual_tx.tx_sig, actual_tx.tx_sig);
+    assert_eq!(
+        actual_tx
+            .info
+            .as_ref()
+            .and_then(|info| info.downcast_ref::<JetTxnInfo>())
+            .map(|info| info.signature),
+        Some(tx.signature)
+    );
     assert_eq!(actual_tx.remote_peer, my_schedule[2]);
+}
+
+#[tokio::test]
+async fn it_should_continue_fanout_after_policy_check_error() {
+    const FANOUT_FACTOR: usize = 3;
+    let (sink, source) = mpsc::unbounded();
+    let (gateway_tx, mut gateway_rx) = mpsc::channel(100);
+    let fake_schedule = FakeLeaderSchedule::default();
+
+    let extra_fanout_pubkeys = vec![Pubkey::new_unique()];
+
+    let my_schedule = vec![
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    ];
+    fake_schedule.set_schedule(my_schedule.clone());
+
+    // Simulates a policy store that fails to find the policy account (e.g. not yet
+    // indexed) for the first leader, but works normally for the rest.
+    pub struct FlakyPolicy {
+        errors_on: Pubkey,
+    }
+
+    impl TransactionPolicyStore for FlakyPolicy {
+        fn is_allowed(&self, _policies: &[Pubkey], leader: &Pubkey) -> Result<bool, CheckError> {
+            if *leader == self.errors_on {
+                Err(CheckError::PolicyNotFound)
+            } else {
+                Ok(true)
+            }
+        }
+    }
+    let policy = FlakyPolicy {
+        errors_on: my_schedule[0],
+    };
+
+    #[allow(deprecated)]
+    let mut fanout = TransactionFanout::new(
+        fake_schedule,
+        policy,
+        source,
+        gateway_tx,
+        FanoutConfig::Custom(FANOUT_FACTOR),
+        extra_fanout_pubkeys.clone(),
+    );
+    let _fanout_jh = tokio::spawn(async move {
+        fanout.run().await;
+    });
+
+    let tx = create_send_transaction_request(Hash::new_unique());
+    sink.unbounded_send(tx.clone()).unwrap();
+
+    // Only my_schedule[0] errors out; the other two scheduled leaders plus the extra
+    // fanout target must still receive the transaction.
+    let expected_recipients = FANOUT_FACTOR - 1 + extra_fanout_pubkeys.len();
+    let mut actual_tx_sent = vec![];
+    for _i in 0..expected_recipients {
+        let actual_tx = gateway_rx.next().await.unwrap();
+        actual_tx_sent.push(actual_tx.remote_peer);
+    }
+
+    assert_eq!(actual_tx_sent.len(), expected_recipients);
+    assert!(!actual_tx_sent.contains(&my_schedule[0]));
+    assert!(actual_tx_sent.contains(&my_schedule[1]));
+    assert!(actual_tx_sent.contains(&my_schedule[2]));
+    assert!(actual_tx_sent.contains(&extra_fanout_pubkeys[0]));
 }
 
 #[tokio::test]
 async fn it_should_support_extra_fanout() {
     const FANOUT_FACTOR: usize = 3;
-    let (sink, source) = mpsc::unbounded_channel();
+    let (sink, source) = mpsc::unbounded();
     let (gateway_tx, mut gateway_rx) = mpsc::channel(100);
-    let (_gateway_response_tx, gateway_response_rx) = mpsc::unbounded_channel();
-    let gateway_bidi = QuicGatewayBidi {
-        sink: gateway_tx,
-        source: gateway_response_rx,
-    };
     let fake_schedule = FakeLeaderSchedule::default();
 
     let extra_fanout_pubkeys = vec![Pubkey::new_unique(), Pubkey::new_unique()];
@@ -201,25 +281,23 @@ async fn it_should_support_extra_fanout() {
 
     #[allow(deprecated)]
     let mut fanout = TransactionFanout::new(
-        Arc::new(fake_schedule),
-        Arc::new(AlwaysAllowTransactionPolicyStore),
+        fake_schedule,
+        AlwaysAllowTransactionPolicyStore,
         source,
-        gateway_bidi,
+        gateway_tx,
         FanoutConfig::Custom(FANOUT_FACTOR),
         extra_fanout_pubkeys.clone(),
-        None,
     );
     let _fanout_jh = tokio::spawn(async move {
         fanout.run().await;
     });
 
-    let tx = create_send_transaction_request(Hash::new_unique(), 0);
-    let tx = Arc::new(tx);
-    sink.send(Arc::clone(&tx)).unwrap();
+    let tx = create_send_transaction_request(Hash::new_unique());
+    sink.unbounded_send(tx.clone()).unwrap();
 
     let mut actual_tx_sent = vec![];
     for _i in 0..FANOUT_FACTOR + extra_fanout_pubkeys.len() {
-        let actual_tx = gateway_rx.recv().await.unwrap();
+        let actual_tx = gateway_rx.next().await.unwrap();
         actual_tx_sent.push(actual_tx);
     }
 
