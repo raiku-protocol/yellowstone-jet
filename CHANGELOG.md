@@ -20,6 +20,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 - Removed Triton-only integrations from the `jet` app: Lewis event reporting (`lewis_events`, `lewis-dummy-server`) and the HTTP transaction-trace drain (`http_txn_trace_drain`, `txn-trace-generator`). Configs that still set either key now fail to load.
 - Removed the `jet-txn-landing-elt` app (ClickHouse sink and purge runner) with its ClickHouse schemas and docker-compose setup, and rpcpool's GoReleaser release config.
 - tpu-client: `SendErrorKind` has a new variant, `UnknownLeader`, so an exhaustive `match` on it needs an arm.
+- tpu-client: `CreateTpuSenderError` has a new variant, `YellowstoneGrpcConnectError`, so an exhaustive `match` on it needs an arm.
+- tpu-client: `rpc_validator_stake_info_service` returns a `Result`.
 
 ### Fixes
 
@@ -27,6 +29,9 @@ The minor version will be incremented upon a breaking change and the patch versi
 - tpu-client: upcoming-leader prediction returns no leaders while the slot tracker is disconnected. It used to panic.
 - tpu-client: a send whose slot has no leader in the schedule fails with `SendErrorKind::UnknownLeader` instead of panicking. The schedule holds two epochs, so this happens when the slot tracker runs ahead of it, around an epoch boundary.
 - tpu-client: a failed leader-schedule fetch at startup is an error from `spawn_managed_leader_schedule` and `create_yellowstone_tpu_sender*`, not a panic, including an RPC node that returns no schedule.
+- tpu-client: `create_yellowstone_tpu_sender` and `create_yellowstone_tpu_sender_with_callback` return `YellowstoneGrpcConnectError` for a gRPC endpoint that is malformed or unreachable, or an x-token that isn't a valid header. They used to panic.
+- tpu-client: a failed vote-account or epoch-info fetch at startup is an error from `rpc_validator_stake_info_service` and `create_yellowstone_tpu_sender*`, not a panic.
+- tpu-client: a node pubkey from the RPC node that doesn't parse is skipped, in the stake and cluster-node lists, at startup and on refresh. It used to panic.
 - tpu-client: upcoming-leader prediction runs on its own timer. It used to run only when a transaction or a connection event woke the driver, so a sender with no traffic re-predicted only when an idle worker shut down, about every 10s, and never pre-connected to some upcoming leaders.
 
 ## [14.9.1]

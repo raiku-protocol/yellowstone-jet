@@ -104,6 +104,11 @@ pub enum CreateTpuSenderError {
     #[error(transparent)]
     YellowstoneGrpcError(#[from] yellowstone_grpc_client::GeyserGrpcClientError),
     ///
+    /// Raised when the Yellowstone gRPC endpoint, its x-token or its TLS config is invalid, or it can't be reached.
+    ///
+    #[error(transparent)]
+    YellowstoneGrpcConnectError(#[from] yellowstone_grpc_client::GeyserGrpcBuilderError),
+    ///
     /// Raised when subscribing to a remote Yellowstone gRPC Subscription ended.
     ///
     #[error("geyser client returned empty slot tracker stream")]
@@ -1250,6 +1255,39 @@ mod tests {
         }
     }
 
+    /// A gRPC endpoint that can't be reached, or an x-token that isn't a valid header, is an
+    /// error, not a panic.
+    #[tokio::test]
+    async fn a_grpc_connect_failure_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unreachable = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        for grpc_x_token in [None, Some("bad\ntoken".to_owned())] {
+            let config = YellowstoneTpuSenderConfig {
+                endpoints: Endpoints {
+                    grpc: Url::parse(&unreachable).unwrap(),
+                    grpc_x_token,
+                    ..Endpoints::default()
+                },
+                ..YellowstoneTpuSenderConfig::default()
+            };
+            let result = create_yellowstone_tpu_sender(
+                config,
+                TpuIdentity::from_keypair(&solana_keypair::Keypair::new()),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(CreateTpuSenderError::YellowstoneGrpcConnectError(_))
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+    }
+
     /// Builds a [`PollYellowstoneTpuSender`] with a fake leader-tpu-info map and a fixed,
     /// single-epoch leader schedule, for tests that don't need real RPC/QUIC services.
     fn test_yellowstone_sender(
@@ -1502,7 +1540,7 @@ where
     tracing::debug!("spawned managed leader schedule");
 
     let (stake_service, stake_info_jh) =
-        rpc_validator_stake_info_service(Arc::clone(&rpc_client), config.stake).await;
+        rpc_validator_stake_info_service(Arc::clone(&rpc_client), config.stake).await?;
 
     tracing::debug!("spawned stake info service");
 
@@ -1644,15 +1682,11 @@ where
         },
     ));
 
-    let grpc_client = GeyserGrpcBuilder::from_shared(grpc.as_str().to_owned())
-        .expect("from_shared")
-        .x_token(grpc_x_token)
-        .expect("x-token")
-        .tls_config(ClientTlsConfig::default().with_enabled_roots())
-        .expect("tls_config")
+    let grpc_client = GeyserGrpcBuilder::from_shared(grpc.as_str().to_owned())?
+        .x_token(grpc_x_token)?
+        .tls_config(ClientTlsConfig::default().with_enabled_roots())?
         .connect()
-        .await
-        .expect("connect");
+        .await?;
 
     tracing::debug!("connected to rpc/grpc endpoints");
 

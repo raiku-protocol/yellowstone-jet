@@ -138,7 +138,8 @@ fn detect_tpu_contact_info_diff(
     let mut ret = new
         .iter()
         .filter_map(|node| {
-            let pubkey = Pubkey::from_str(&node.pubkey).expect("Pubkey::from_str");
+            // A node pubkey that doesn't parse is the RPC node's fault; skip it.
+            let pubkey = Pubkey::from_str(&node.pubkey).ok()?;
             let contact_info = RpcTpuQuicContactInfo::from(node);
             to_remove.remove(&pubkey);
             match current.get(&pubkey) {
@@ -253,11 +254,12 @@ pub async fn rpc_cluster_tpu_info_service(
         .get_cluster_nodes()
         .await?
         .into_iter()
-        .map(|node| {
-            (
-                Pubkey::from_str(node.pubkey.as_str()).expect("Pubkey::from_str"),
+        // A node pubkey that doesn't parse is the RPC node's fault; skip it.
+        .filter_map(|node| {
+            Some((
+                Pubkey::from_str(node.pubkey.as_str()).ok()?,
                 RpcTpuQuicContactInfo::from(&node),
-            )
+            ))
         })
         .collect::<std::collections::HashMap<_, _>>();
 
