@@ -447,6 +447,13 @@ pub enum SendErrorKind {
     /// No remote peers currently matched the user-provided `Blocklist`.
     #[display("destination(s) blocked")]
     RemotePeerBlocked,
+    ///
+    /// The leader schedule has no leader for a slot the send targets: the slot tracker is
+    /// ahead of the epochs the schedule holds, typically around an epoch boundary. Nothing
+    /// was sent.
+    ///
+    #[display("no leader known for the slot")]
+    UnknownLeader,
 }
 
 ///
@@ -738,9 +745,7 @@ impl YellowstoneTpuSender {
             .map(|i| floor_leader_boundary + (i * 4) as u64)
             .map(|leader_slot_boundary| self.leader_schedule.get_leader(leader_slot_boundary))
             .filter_map(|res| match res {
-                Ok(None) => {
-                    panic!("unknown leader for slot boundary {floor_leader_boundary}");
-                }
+                Ok(None) => Some(Err(SendErrorKind::UnknownLeader)),
                 Ok(Some(leader)) => {
                     if let Some(blocklist) = &blocklist {
                         if blocklist.is_blocked(&leader) {
@@ -1116,9 +1121,7 @@ impl PollYellowstoneTpuSender {
                 self.sender.leader_schedule.get_leader(leader_slot_boundary)
             })
             .filter_map(|res| match res {
-                Ok(None) => {
-                    panic!("unknown leader for slot boundary {floor_leader_boundary}");
-                }
+                Ok(None) => Some(Err(SendErrorKind::UnknownLeader)),
                 Ok(Some(leader)) => {
                     if let Some(blocklist) = &blocklist {
                         if blocklist.is_blocked(&leader) {
@@ -1394,6 +1397,31 @@ mod tests {
         assert_eq!(received.remote_peer, leader);
     }
 
+    #[tokio::test]
+    async fn start_send_txn_with_blocklist_returns_unknown_leader_outside_the_schedule() {
+        // An empty schedule knows no leader for slot 0.
+        let (mut sender, _rx) = test_yellowstone_sender(HashMap::new(), true, 0, vec![]);
+
+        let err = sender
+            .start_send_txn_with_blocklist(Bytes::from_static(b"wire"), None::<Vec<Pubkey>>, None)
+            .expect_err("expected no leader for the slot");
+
+        assert!(matches!(err.kind, SendErrorKind::UnknownLeader));
+    }
+
+    #[tokio::test]
+    async fn send_txn_fanout_with_blocklist_returns_unknown_leader_outside_the_schedule() {
+        let (sender, _rx) = test_yellowstone_sender(HashMap::new(), true, 0, vec![]);
+        let mut sender = sender.into_inner();
+
+        let err = sender
+            .send_txn_fanout_with_blocklist(b"wire".to_vec(), None::<Vec<Pubkey>>, None)
+            .await
+            .expect_err("expected no leader for the slot");
+
+        assert!(matches!(err.kind, SendErrorKind::UnknownLeader));
+    }
+
     #[test]
     fn drop_of_last_sender_cancels_lifecycle_shutdown() {
         let (sender, _rx) = test_yellowstone_sender(HashMap::new(), true, 0, vec![]);
@@ -1469,9 +1497,7 @@ where
     tracing::debug!("spawned tpu info service");
 
     let (managed_leader_schedule, managed_leader_schedule_jh) =
-        spawn_managed_leader_schedule(Arc::clone(&rpc_client), config.schedule)
-            .await
-            .expect("spawn_managed_leader_schedule");
+        spawn_managed_leader_schedule(Arc::clone(&rpc_client), config.schedule).await?;
 
     tracing::debug!("spawned managed leader schedule");
 

@@ -366,6 +366,11 @@ impl Default for ManagedLeaderScheduleConfig {
     }
 }
 
+/// The RPC node returned no leader schedule for `epoch`.
+fn missing_schedule(epoch: &str) -> client_error::ClientError {
+    client_error::ClientErrorKind::Custom(format!("no leader schedule for {epoch}")).into()
+}
+
 ///
 /// Spawn a managed leader schedule that automatically updates as epochs progress.
 ///
@@ -376,7 +381,7 @@ pub async fn spawn_managed_leader_schedule(
     let initial_schedule = rpc_client
         .get_unnested_leader_schedule(None)
         .await?
-        .expect("Failed to fetch initial leader schedule");
+        .ok_or_else(|| missing_schedule("the current epoch"))?;
 
     let current_epoch = initial_schedule.first_slot / DEFAULT_SLOTS_PER_EPOCH;
     let next_epoch_first_slot = (current_epoch + 1) * DEFAULT_SLOTS_PER_EPOCH;
@@ -384,7 +389,7 @@ pub async fn spawn_managed_leader_schedule(
     let next_schedule = rpc_client
         .get_unnested_leader_schedule(Some(next_epoch_first_slot))
         .await?
-        .expect("Failed to fetch next leader schedule");
+        .ok_or_else(|| missing_schedule("the next epoch"))?;
 
     let shared = Arc::new(RwLock::new(InnerManagedLeaderSchedule {
         double_buffer: [initial_schedule, next_schedule],

@@ -108,7 +108,8 @@ where
                     SendErrorKind::ManagedLeaderScheduleDisconnected => {
                         return Poll::Ready(Err(TpuSinkError::ManagedLeaderScheduleDisconnected));
                     }
-                    SendErrorKind::RemotePeerBlocked => continue,
+                    // Passing: the schedule catches up with the slot.
+                    SendErrorKind::RemotePeerBlocked | SendErrorKind::UnknownLeader => continue,
                 }
             }
         }

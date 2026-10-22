@@ -19,11 +19,14 @@ The minor version will be incremented upon a breaking change and the patch versi
 - Proto field `TransactionConfig.skip_sanitize` (field 2) is now reserved.
 - Removed Triton-only integrations from the `jet` app: Lewis event reporting (`lewis_events`, `lewis-dummy-server`) and the HTTP transaction-trace drain (`http_txn_trace_drain`, `txn-trace-generator`). Configs that still set either key now fail to load.
 - Removed the `jet-txn-landing-elt` app (ClickHouse sink and purge runner) with its ClickHouse schemas and docker-compose setup, and rpcpool's GoReleaser release config.
+- tpu-client: `SendErrorKind` has a new variant, `UnknownLeader`, so an exhaustive `match` on it needs an arm.
 
 ### Fixes
 
 - tpu-client: a slot-stream error no longer panics the Yellowstone slot tracker. `AutoReconnectStream` yields the error before it resubscribes, and the tracker used to `panic_any` on it, which aborts a `panic = "abort"` process, for example when the gRPC provider restarts its servers. The tracker now reports disconnected from the error until the first slot newer than the last one it saw, so sends fail with `SlotTrackerDisconnected` instead of going to a past leader. A slot update without its payload (`update_oneof`) is skipped, at startup and after, instead of panicking.
 - tpu-client: upcoming-leader prediction returns no leaders while the slot tracker is disconnected. It used to panic.
+- tpu-client: a send whose slot has no leader in the schedule fails with `SendErrorKind::UnknownLeader` instead of panicking. The schedule holds two epochs, so this happens when the slot tracker runs ahead of it, around an epoch boundary.
+- tpu-client: a failed leader-schedule fetch at startup is an error from `spawn_managed_leader_schedule` and `create_yellowstone_tpu_sender*`, not a panic, including an RPC node that returns no schedule.
 - tpu-client: upcoming-leader prediction runs on its own timer. It used to run only when a transaction or a connection event woke the driver, so a sender with no traffic re-predicted only when an idle worker shut down, about every 10s, and never pre-connected to some upcoming leaders.
 
 ## [14.9.1]
