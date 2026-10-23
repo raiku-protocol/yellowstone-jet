@@ -109,6 +109,12 @@ pub enum CreateTpuSenderError {
     #[error(transparent)]
     YellowstoneGrpcConnectError(#[from] yellowstone_grpc_client::GeyserGrpcBuilderError),
     ///
+    /// Raised when the TPU sender's local QUIC endpoints can't be created, such as when no UDP
+    /// port in the configured range can be bound.
+    ///
+    #[error(transparent)]
+    QuicEndpointError(#[from] std::io::Error),
+    ///
     /// Raised when subscribing to a remote Yellowstone gRPC Subscription ended.
     ///
     #[error("geyser client returned empty slot tracker stream")]
@@ -1575,7 +1581,7 @@ where
         callback,
         config.channel_capacity,
     )
-    .await;
+    .await?;
 
     tracing::debug!("created base tpu sender");
 

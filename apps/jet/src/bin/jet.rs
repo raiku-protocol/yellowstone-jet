@@ -394,7 +394,7 @@ async fn run_jet(
         Some(jet_callback),
         1000, // This capacity should not be too deep, so transaction does not sits too long in the queue.
     )
-    .await;
+    .await?;
     let tpu_identity_updater = tpu_sender.get_owned_identity_updater();
     let tpu_sender = PollTpuSender::new(tpu_sender);
 
