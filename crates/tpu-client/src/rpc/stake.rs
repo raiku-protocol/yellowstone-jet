@@ -5,7 +5,10 @@ use {
     crate::{core::ValidatorStakeInfoService, rpc::solana_rpc_utils::SolanaRpcErrorKindExt},
     futures::{StreamExt, stream},
     serde::Deserialize,
-    solana_client::{nonblocking::rpc_client::RpcClient, rpc_response::RpcVoteAccountStatus},
+    solana_client::{
+        client_error::ClientError, nonblocking::rpc_client::RpcClient,
+        rpc_response::RpcVoteAccountStatus,
+    },
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
@@ -33,12 +36,13 @@ fn extract_node_stake_mapping(
         .current
         .iter()
         .chain(&rpc_vote_account_status.delinquent)
-        .map(|vote_account_info| {
+        // A node pubkey that doesn't parse is the RPC node's fault; skip it.
+        .filter_map(|vote_account_info| {
             Pubkey::from_str(vote_account_info.node_pubkey.as_str())
+                .ok()
                 .map(|pubkey| (pubkey, vote_account_info.activated_stake))
         })
-        .collect::<Result<HashMap<_, _>, _>>()
-        .expect("Failed to parse validator accounts")
+        .collect()
 }
 
 struct StakeInfoMapInner {
@@ -230,17 +234,10 @@ pub(crate) async fn build_validator_stake_info_service_inner(
     rpc: Arc<RpcClient>,
     config: RpcValidatorStakeInfoServiceConfig,
     cnc_rx: Option<mpsc::Receiver<CacheStakeInfoMapCommand>>,
-) -> (RpcValidatorStakeInfoService, JoinHandle<()>) {
-    let initial_value = rpc
-        .get_vote_accounts()
-        .await
-        .expect("Failed to get vote accounts");
+) -> Result<(RpcValidatorStakeInfoService, JoinHandle<()>), ClientError> {
+    let initial_value = rpc.get_vote_accounts().await?;
 
-    let current_epoch = rpc
-        .get_epoch_info()
-        .await
-        .expect("Failed to get epoch info")
-        .epoch;
+    let current_epoch = rpc.get_epoch_info().await?.epoch;
     let initial_stake_mappings = extract_node_stake_mapping(initial_value);
     let total_stakes = initial_stake_mappings.values().sum();
 
@@ -269,7 +266,7 @@ pub(crate) async fn build_validator_stake_info_service_inner(
 
     let jh = tokio::spawn(task.run());
 
-    (ret, jh)
+    Ok((ret, jh))
 }
 
 ///
@@ -282,7 +279,8 @@ pub(crate) async fn build_validator_stake_info_service_inner(
 ///
 /// # Returns
 ///
-/// An instance of `RpcValidatorStakeInfoService`.
+/// An instance of `RpcValidatorStakeInfoService`, or the error from the initial vote-account or
+/// epoch-info fetch.
 ///
 /// Note: This function spawns a background task to periodically refresh the stake info map.
 /// When all references to the returned service are dropped, the background task will be stopped automatically.
@@ -290,7 +288,7 @@ pub(crate) async fn build_validator_stake_info_service_inner(
 pub async fn rpc_validator_stake_info_service(
     rpc: Arc<RpcClient>,
     config: RpcValidatorStakeInfoServiceConfig,
-) -> (RpcValidatorStakeInfoService, JoinHandle<()>) {
+) -> Result<(RpcValidatorStakeInfoService, JoinHandle<()>), ClientError> {
     build_validator_stake_info_service_inner(rpc, config, None).await
 }
 
@@ -318,6 +316,18 @@ pub mod tests {
         std::sync::Arc,
         tokio::sync::{mpsc, oneshot},
     };
+
+    #[test]
+    fn a_node_pubkey_that_does_not_parse_is_skipped() {
+        let node = Keypair::new().pubkey();
+        let mut bad = mock_rpc_vote_account_info(node, 5);
+        bad.node_pubkey = "not-a-pubkey".to_owned();
+        let mapping = super::extract_node_stake_mapping(RpcVoteAccountStatus {
+            current: vec![mock_rpc_vote_account_info(node, 100)],
+            delinquent: vec![bad],
+        });
+        assert_eq!(mapping, std::collections::HashMap::from([(node, 100)]));
+    }
 
     pub fn mock_rpc_vote_account_info(
         validator_pubkey: Pubkey,
@@ -361,7 +371,9 @@ pub mod tests {
             mock_rpc_sender.clone(),
             RpcClientConfig::default(),
         ));
-        let (stake_info_map, _handle) = stake::rpc_validator_stake_info_service(mock, config).await;
+        let (stake_info_map, _handle) = stake::rpc_validator_stake_info_service(mock, config)
+            .await
+            .expect("stake info service");
 
         let actual = stake_info_map
             .get_stake_info(&node_kp1.pubkey())
@@ -377,20 +389,15 @@ pub mod tests {
     }
 
     #[tokio::test]
-    pub async fn it_should_panic_during_spawn_if_rpc_error() {
+    pub async fn it_should_fail_during_spawn_if_rpc_error() {
         let mock_rpc_sender = MockRpcSender::all_fatal_errors();
         let mock = Arc::new(RpcClient::new_sender(
             mock_rpc_sender,
             RpcClientConfig::default(),
         ));
-        tokio::spawn(async move {
-            stake::build_validator_stake_info_service_inner(mock, Default::default(), None)
-                .await
-                .1
-                .await
-        })
-        .await
-        .expect_err("should panic");
+        let result =
+            stake::build_validator_stake_info_service_inner(mock, Default::default(), None).await;
+        assert!(result.is_err(), "should fail");
     }
 
     #[tokio::test]
@@ -419,7 +426,9 @@ pub mod tests {
             refresh_interval: std::time::Duration::from_secs(1),
         };
         let (stake_info_map, cache_fresh_fut) =
-            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx)).await;
+            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx))
+                .await
+                .expect("stake info service");
 
         let handle = tokio::spawn(cache_fresh_fut);
 
@@ -506,7 +515,9 @@ pub mod tests {
             refresh_interval: std::time::Duration::from_secs(1),
         };
         let (stake_info_map, handle) =
-            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx)).await;
+            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx))
+                .await
+                .expect("stake info service");
 
         let actual = stake_info_map.get_total_stake();
         assert_eq!(actual, 1100);
@@ -564,7 +575,9 @@ pub mod tests {
         };
 
         let (stake_info_map, handle) =
-            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx)).await;
+            stake::build_validator_stake_info_service_inner(mock, config, Some(cnc_rx))
+                .await
+                .expect("stake info service");
 
         let actual = stake_info_map.get_total_stake();
         assert_eq!(actual, 1100);

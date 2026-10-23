@@ -3372,7 +3372,7 @@ impl TpuSenderDriverSpawner {
         &self,
         identity: TpuIdentity,
         callback_sink: CB,
-    ) -> TpuSenderSessionContext
+    ) -> std::io::Result<TpuSenderSessionContext>
     where
         CB: TpuSenderResponseCallback,
     {
@@ -3385,7 +3385,10 @@ impl TpuSenderDriverSpawner {
         )
     }
 
-    pub fn spawn_with_default(&self, identity: TpuIdentity) -> TpuSenderSessionContext {
+    pub fn spawn_with_default(
+        &self,
+        identity: TpuIdentity,
+    ) -> std::io::Result<TpuSenderSessionContext> {
         self.spawn::<Nothing>(
             identity,
             Default::default(),
@@ -3402,7 +3405,7 @@ impl TpuSenderDriverSpawner {
         eviction_strategy: Arc<dyn ConnectionEvictionStrategy + Send + Sync + 'static>,
         leader_schedule: Arc<dyn UpcomingLeaderPredictor + Send + Sync + 'static>,
         callback_sink: Option<CB>,
-    ) -> TpuSenderSessionContext
+    ) -> std::io::Result<TpuSenderSessionContext>
     where
         CB: TpuSenderResponseCallback,
     {
@@ -3424,7 +3427,7 @@ impl TpuSenderDriverSpawner {
         leader_predictor: Arc<dyn UpcomingLeaderPredictor + Send + Sync + 'static>,
         response_callback: Option<CB>,
         driver_rt: Handle,
-    ) -> TpuSenderSessionContext
+    ) -> std::io::Result<TpuSenderSessionContext>
     where
         CB: TpuSenderResponseCallback,
     {
@@ -3449,28 +3452,37 @@ impl TpuSenderDriverSpawner {
         let bind_addr = config.endpoint_bind_addr;
         let mut endpoints = vec![];
         for _ in 0..config.num_endpoints.get() {
+            let mut last_error = None;
             let endpoint = (0..config.max_local_port_binding_attempts)
                 .find_map(|_| {
-                    let (_, client_socket) =
+                    let attempt =
                         solana_net_utils::bind_in_range(bind_addr, config.endpoint_port_range)
-                            .ok()?;
-                    Endpoint::new(
-                        quinn::EndpointConfig::default(),
-                        None,
-                        client_socket,
-                        Arc::new(quinn::TokioRuntime),
-                    )
-                    .ok()
+                            .and_then(|(_, client_socket)| {
+                                Endpoint::new(
+                                    quinn::EndpointConfig::default(),
+                                    None,
+                                    client_socket,
+                                    Arc::new(quinn::TokioRuntime),
+                                )
+                            });
+                    attempt.map_err(|err| last_error = Some(err)).ok()
                 })
-                .unwrap_or_else(|| {
-                    // A non-wildcard bind address that is not configured on the host fails here
-                    // with EADDRNOTAVAIL. Abort rather than fall back to the wildcard, which
-                    // would silently source traffic from the host's primary address.
-                    panic!(
-                        "Failed to create QUIC endpoint bound to {bind_addr} in port range {:?} after {} attempts",
-                        config.endpoint_port_range, config.max_local_port_binding_attempts,
+                // A non-wildcard bind address that is not configured on the host fails here
+                // with EADDRNOTAVAIL. Fail rather than fall back to the wildcard, which
+                // would silently source traffic from the host's primary address.
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        last_error
+                            .as_ref()
+                            .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+                        format!(
+                            "failed to create QUIC endpoint bound to {bind_addr} in port range {:?} after {} attempts: {}",
+                            config.endpoint_port_range,
+                            config.max_local_port_binding_attempts,
+                            last_error.map_or_else(|| "no attempts".to_owned(), |err| err.to_string()),
+                        ),
                     )
-                });
+                })?;
 
             endpoints.push(endpoint);
         }
@@ -3519,14 +3531,14 @@ impl TpuSenderDriverSpawner {
 
         let jh = driver_rt.spawn(driver.run());
 
-        TpuSenderSessionContext {
+        Ok(TpuSenderSessionContext {
             driver_tx_sink: tx_inlet,
             identity_updater: TpuSenderIdentityUpdater {
                 cnc_tx: PollSender::new(driver_cnc_tx),
                 current_identity_pubkey,
             },
             driver_join_handle: jh,
-        }
+        })
     }
 }
 

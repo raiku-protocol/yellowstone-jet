@@ -121,8 +121,7 @@ impl TpuSender {
 ///
 /// # Returns
 ///
-/// A tuple containing the created `TpuSender` and a receiver for `TpuSenderResponse`.
-/// You can drop the receiver if you don't need to handle responses.
+/// The created `TpuSender`, or the error from creating its local QUIC endpoints.
 ///
 /// Note: This function is `async` because it requires spawning async tasks for the TPU sender driver.
 /// This function is a building block for higher-level TPU client factories.
@@ -137,7 +136,7 @@ pub async fn create_base_tpu_client<CB>(
     leader_schedule_predictor: Arc<dyn UpcomingLeaderPredictor + Send + Sync>,
     callback: Option<CB>,
     txn_capacity: usize,
-) -> TpuSender
+) -> std::io::Result<TpuSender>
 where
     CB: TpuSenderResponseCallback,
 {
@@ -153,7 +152,7 @@ where
         eviction_strategy,
         leader_schedule_predictor,
         callback,
-    );
+    )?;
 
     let TpuSenderSessionContext {
         identity_updater,
@@ -161,10 +160,10 @@ where
         driver_join_handle: _,
     } = session;
 
-    TpuSender {
+    Ok(TpuSender {
         identity_updater,
         txn_tx: PollSender::new(driver_tx_sink),
-    }
+    })
 }
 
 impl TpuSenderResponseCallback for UnboundedSender<TpuSenderResponse> {

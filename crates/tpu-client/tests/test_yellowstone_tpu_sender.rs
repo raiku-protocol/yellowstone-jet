@@ -201,7 +201,8 @@ async fn build_sender_from_parts(
         Option::<Nothing>::None,
         128,
     )
-    .await;
+    .await
+    .expect("tpu sender");
 
     YellowstoneTpuSender::from_parts(
         base_tpu_sender,
