@@ -61,7 +61,7 @@ use {
     solana_pubkey::Pubkey,
     std::{
         any::TypeId,
-        collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map},
         future,
         net::SocketAddr,
         num::NonZeroUsize,
@@ -85,15 +85,9 @@ use {
 /// This has been copy-pasted from `solana_streamer::nonblocking::quic::ALPN_TPU_PROTOCOL_ID`
 pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
-/// Solana's max transaction wire size. `1232` bytes per the original packet-size limit;
-/// `4096` under the `simd-0296` feature, once a target cluster has activated that SIMD
-/// raising the limit. See `accept_tx`'s size check, which rejects anything larger than
-/// this (unless `unsafe_allow_arbitrary_txn_size` is set).
-#[cfg(not(feature = "simd-0296"))]
-pub const PACKET_DATA_SIZE: usize = 1232;
-
-/// See the `simd-0296`-disabled definition of `PACKET_DATA_SIZE` above.
-#[cfg(feature = "simd-0296")]
+/// Solana's max transaction wire size, as raised to `4096` bytes by SIMD-0296. See
+/// `accept_tx`'s size check, which rejects anything larger than this (unless
+/// `unsafe_allow_arbitrary_txn_size` is set).
 pub const PACKET_DATA_SIZE: usize = 4096;
 
 pub const QUIC_SEND_FAIRNESS: bool = false;
@@ -515,6 +509,76 @@ struct OrphanConnectionInfo {
     connection_version: u64,
 }
 
+///
+/// Wakes the driver loop when the oldest orphan connection expires.
+///
+/// The [`Sleep`] is boxed and kept across loop iterations: the first poll of a tokio timer takes
+/// a lock, and the next expiration rarely changes between iterations. Once the timer fires it is
+/// disarmed, because a completed [`Sleep`] stays ready forever and would make the driver loop spin
+/// until the next orphan connection expires.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut timer = OrphanExpirationTimer::default();
+/// timer.arm(orphan_connection_set.oldest().map(|oldest| oldest + ttl));
+/// if timer.is_armed() {
+///     timer.expired().await;
+///     // evict the expired orphan connections, then call `arm` again.
+/// }
+/// ```
+///
+#[derive(Default)]
+struct OrphanExpirationTimer {
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl OrphanExpirationTimer {
+    ///
+    /// Arms the timer for `expiration` unless it is already armed, or disarms it when there is no
+    /// orphan connection left.
+    ///
+    /// # Arguments
+    ///
+    /// * `expiration` - When the oldest orphan connection expires, or [`None`] if there is none.
+    ///
+    fn arm(&mut self, expiration: Option<Instant>) {
+        let Some(expiration) = expiration else {
+            self.sleep = None;
+            return;
+        };
+        if self.sleep.is_none() {
+            let sleep_dur = expiration.saturating_duration_since(Instant::now());
+            self.sleep = Some(Box::pin(tokio::time::sleep(sleep_dur)));
+        }
+    }
+
+    ///
+    /// Tells whether the timer is waiting on an expiration.
+    ///
+    /// # Returns
+    ///
+    /// `true` if [`Self::expired`] would wait on a deadline.
+    ///
+    const fn is_armed(&self) -> bool {
+        self.sleep.is_some()
+    }
+
+    ///
+    /// Waits until the armed expiration, then disarms the timer so the next [`Self::arm`]
+    /// schedules the following expiration.
+    ///
+    /// Returns immediately if the timer is not armed. Dropping the future before it completes
+    /// leaves the timer armed.
+    ///
+    async fn expired(&mut self) {
+        if let Some(sleep) = self.sleep.as_mut() {
+            sleep.as_mut().await;
+        }
+        self.sleep = None;
+    }
+}
+
 #[derive(Default)]
 struct ConnectionEvictionSet {
     set: HashSet<ConnectionEviction>,
@@ -591,6 +655,20 @@ pub struct ActiveConnection {
     conn: Arc<Connection>,
     connection_version: u64,
     multiplexed_remote_peer_identity_with_stake: HashMap<Pubkey, u64>,
+}
+
+impl ActiveConnection {
+    ///
+    /// Tells whether the connection is closed, by either side, so it can no longer open streams.
+    ///
+    /// # Returns
+    ///
+    /// `true` once the [`Connection`] has a close reason, for example after agave's TPU refused
+    /// it with `ApplicationClose(4, "too_many")`, `false` while it is still usable.
+    ///
+    fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
+    }
 }
 
 pub trait LeaderTpuInfoService {
@@ -951,6 +1029,12 @@ impl ConnectingTask {
 
             let max_idle_timeout = IdleTimeout::try_from(self.max_idle_timeout)
                 .expect("Failed to set QUIC max idle timeout");
+            res.datagram_receive_buffer_size(None);
+            // The validator can't open any stream to the client, either bidirectional or unidirectional.
+            // The client never sends MAX_STREAMS frames to raise that limit. If the peer opened a stream anyway, that would break the protocol and close the connection with STREAM_LIMIT_ERROR.
+            // Quinn reserves no state for incoming streams: no per-stream receive windows and no slots for incoming streams.
+            res.max_concurrent_bidi_streams(0u32.into());
+            res.max_concurrent_uni_streams(0u32.into());
             res.max_idle_timeout(Some(max_idle_timeout));
             res.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
             // We don't want fairness : https://github.com/quinn-rs/quinn/pull/2002
@@ -963,7 +1047,6 @@ impl ConnectingTask {
 
         let mut config = ClientConfig::new(Arc::new(self.identity.insecure_clone()));
         config.transport_config(Arc::new(transport_config));
-
         let server_name = socket_addr_to_quic_server_name(remote_peer_addr);
         let connecting = self
             .endpoint
@@ -1811,8 +1894,8 @@ where
             return;
         }
 
-        if self.connection_map.contains_key(&remote_peer_addr) {
-            // We already have an active connection for the remote peer address
+        if self.has_reusable_connection(remote_peer_addr) {
+            // We already have an open connection for the remote peer address
             tracing::debug!(
                 "Re-using existing active connection to remote peer address: {} for remote peer identity: {}",
                 remote_peer_addr,
@@ -2476,14 +2559,104 @@ where
     }
 
     ///
+    /// Removes a connection from the driver and gives its slot to the next connection attempt
+    /// waiting on eviction.
+    ///
+    /// Every connection leaves [`TpuSenderDriver::connection_map`] through this method, so the
+    /// indexes kept per connection ([`TpuSenderDriver::orphan_connection_set`],
+    /// [`TpuSenderDriver::pending_connection_eviction_set`] and
+    /// [`TpuSenderDriver::active_staked_sorted_remote_peer_addr`]) are cleared together with it.
+    ///
+    /// # Arguments
+    ///
+    /// - `remote_peer_addr`: The socket address of the connection to remove.
+    /// - `connection_version`: The version of the connection to remove. A newer connection to the
+    ///   same address is left untouched.
+    ///
+    /// # Returns
+    ///
+    /// The removed [`ActiveConnection`], or `None` if `remote_peer_addr` holds no connection of
+    /// that version. The connection is not closed: workers still holding it keep it alive until
+    /// they exit.
+    ///
+    fn remove_connection(
+        &mut self,
+        remote_peer_addr: SocketAddr,
+        connection_version: u64,
+    ) -> Option<ActiveConnection> {
+        let hash_map::Entry::Occupied(entry) = self.connection_map.entry(remote_peer_addr) else {
+            return None;
+        };
+        if entry.get().connection_version != connection_version {
+            return None;
+        }
+        let active_conn = entry.remove();
+        self.orphan_connection_set
+            .remove(&remote_peer_addr, connection_version);
+        self.pending_connection_eviction_set
+            .remove(&ConnectionEviction {
+                remote_peer_addr,
+                connection_version,
+            });
+        self.active_staked_sorted_remote_peer_addr
+            .remove(&remote_peer_addr);
+        self.unblock_eviction_waiting_connection();
+        Some(active_conn)
+    }
+
+    ///
+    /// Tells whether a new worker can use the cached connection to `remote_peer_addr`.
+    ///
+    /// A cached connection can be closed without the driver knowing: the remote peer may close
+    /// it while no worker watches it (an orphan connection), or while its last worker is still
+    /// being reaped. A closed connection is removed here, through
+    /// [`TpuSenderDriver::remove_connection`], so it is never handed to a worker and the caller
+    /// connects again.
+    ///
+    /// # Arguments
+    ///
+    /// - `remote_peer_addr`: The socket address to look up.
+    ///
+    /// # Returns
+    ///
+    /// `true` if [`TpuSenderDriver::connection_map`] holds an open connection to
+    /// `remote_peer_addr`, `false` if it holds none or held a closed one.
+    ///
+    fn has_reusable_connection(&mut self, remote_peer_addr: SocketAddr) -> bool {
+        let Some(active_conn) = self.connection_map.get(&remote_peer_addr) else {
+            return false;
+        };
+        if !active_conn.is_closed() {
+            return true;
+        }
+        tracing::debug!(
+            "Dropping closed connection to remote peer address: {} (version {}): {:?}",
+            remote_peer_addr,
+            active_conn.connection_version,
+            active_conn.conn.close_reason(),
+        );
+        let connection_version = active_conn.connection_version;
+        self.remove_connection(remote_peer_addr, connection_version);
+        false
+    }
+
+    ///
     /// Removes a worker from an active connection's multiplexed peer list.
     ///
-    /// If the connection has no more multiplexed peers and is marked for eviction,
-    /// the connection is removed from the active connection map and eviction waiters are unblocked.
+    /// When the connection has no more multiplexed peers, it is removed through
+    /// [`TpuSenderDriver::remove_connection`] if it is marked for eviction or closed, and kept as
+    /// an orphan connection for reuse otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// - `remote_peer_addr`: The socket address of the worker's connection.
+    /// - `remote_peer_identity`: The remote peer identity the worker sent to.
+    /// - `expected_connection_version`: The version of the connection the worker used.
     ///
     /// # Note
     ///
-    /// if the connection version does not match the expected version, the removal operation is ignored, not mutation is performed.
+    /// If `remote_peer_addr` holds no connection of `expected_connection_version`, nothing is
+    /// changed: the worker's connection was already removed, or replaced by a newer one.
     ///
     fn remove_worker_from_active_connection(
         &mut self,
@@ -2493,9 +2666,10 @@ where
     ) {
         if let Some(active_conn) = self.connection_map.get_mut(&remote_peer_addr) {
             if active_conn.connection_version != expected_connection_version {
-                // This means the connection has been re-established since the worker was created.
+                // The connection has been re-established since the worker was created: either it
+                // was evicted, or it was closed and replaced while this worker still held it.
                 // So we don't need to remove the multiplexed peer from this connection.
-                tracing::warn!(
+                tracing::debug!(
                     "Skipping removal of remote peer: {} from active connection at address: {} due to connection version mismatch, expected: {}, actual: {}",
                     remote_peer_identity,
                     remote_peer_addr,
@@ -2508,16 +2682,16 @@ where
                 .multiplexed_remote_peer_identity_with_stake
                 .remove(&remote_peer_identity);
 
-            let connection_eviction = ConnectionEviction {
-                remote_peer_addr,
-                connection_version: expected_connection_version,
-            };
-            let is_connection_mark_for_eviction = self
-                .pending_connection_eviction_set
-                .contains(&connection_eviction);
+            let is_connection_mark_for_eviction =
+                self.pending_connection_eviction_set
+                    .contains(&ConnectionEviction {
+                        remote_peer_addr,
+                        connection_version: expected_connection_version,
+                    });
             let has_no_worker = active_conn
                 .multiplexed_remote_peer_identity_with_stake
                 .is_empty();
+            let is_closed = active_conn.is_closed();
 
             let new_stake_for_addr: u64 = active_conn
                 .multiplexed_remote_peer_identity_with_stake
@@ -2528,13 +2702,10 @@ where
                 .insert(remote_peer_addr, new_stake_for_addr);
 
             if has_no_worker {
-                if is_connection_mark_for_eviction {
-                    self.connection_map.remove(&remote_peer_addr);
-                    self.pending_connection_eviction_set
-                        .remove(&connection_eviction);
-                    self.unblock_eviction_waiting_connection();
-                    self.active_staked_sorted_remote_peer_addr
-                        .remove(&remote_peer_addr);
+                // A closed connection can't open streams anymore: free its slot instead of
+                // keeping it for reuse.
+                if is_connection_mark_for_eviction || is_closed {
+                    self.remove_connection(remote_peer_addr, expected_connection_version);
                 } else {
                     let orphan_conn_info = OrphanConnectionInfo {
                         remote_peer_addr,
@@ -2572,21 +2743,13 @@ where
                     .remove(&remote_peer_identity)
                     .expect("tx worker sender");
 
-                if let Some(active_conn) = self.connection_map.get_mut(&worker_tx.remote_peer_addr)
-                {
-                    let active_conn_version = active_conn.connection_version;
-                    let worker_conn_version = worker_tx.connection_version;
-                    assert!(
-                        active_conn_version == worker_conn_version,
-                        "Connection version mismatch for remote peer: {remote_peer_identity}, active: {active_conn_version}, worker: {worker_conn_version}",
-                    );
-
-                    self.remove_worker_from_active_connection(
-                        worker_tx.remote_peer_addr,
-                        remote_peer_identity,
-                        worker_conn_version,
-                    );
-                }
+                // The worker's connection may already be gone: a multiplexed sibling's rescue
+                // replaces a closed shared connection while this worker still held it.
+                self.remove_worker_from_active_connection(
+                    worker_tx.remote_peer_addr,
+                    remote_peer_identity,
+                    worker_tx.connection_version,
+                );
                 self.last_peer_activity.remove(&remote_peer_identity);
                 drop(worker_tx);
 
@@ -3006,19 +3169,12 @@ where
                     // this orphan entry is stale.
                     continue;
                 }
-                let Some(active_conn) = self.connection_map.remove(&remote_peer_addr) else {
+                let Some(active_conn) =
+                    self.remove_connection(remote_peer_addr, connection_version)
+                else {
                     continue;
                 };
-
-                assert!(
-                    active_conn
-                        .multiplexed_remote_peer_identity_with_stake
-                        .is_empty(),
-                    "Evicting connection to remote peer address: {remote_peer_addr} that still has multiplexed peers",
-                );
                 active_conn.conn.close(VarInt::from_u32(0), &[0u8]);
-                drop(active_conn);
-                self.unblock_eviction_waiting_connection();
                 #[cfg(feature = "prometheus")]
                 {
                     prom::incr_evicted_orphan_connections();
@@ -3035,7 +3191,7 @@ where
         }
         #[allow(unused_mut, dead_code)]
         let mut last_metric_update = Instant::now();
-        let mut sleep_timer: Option<Pin<Box<Sleep>>> = None;
+        let mut orphan_expiration_timer = OrphanExpirationTimer::default();
         // Wakes the loop at the next prediction deadline. Without it, prediction only runs when
         // some other event (a transaction, a connection result) happens to arrive after the deadline,
         // so a quiet sender stops pre-connecting to upcoming leaders.
@@ -3058,23 +3214,7 @@ where
                 prediction_timer.as_mut().reset(next_prediction_deadline);
             }
 
-            let next_connection_expiration = self.next_orphan_connection_expiration();
-            match next_connection_expiration {
-                Some(expiration_instant) => {
-                    let now = Instant::now();
-                    if sleep_timer.is_none() {
-                        let sleep_dur = expiration_instant.saturating_duration_since(now);
-                        // If I understand tokio correclty, the first time you poll a timer it must acquire a mutex lock.
-                        // So we box it and pin it to avoid re-creating the timer on every loop iteration since next orphan connection expiration
-                        // is unlikely to change until we evict some connections.
-                        // Also, the next orphan connection deadline can only increase overtime.
-                        sleep_timer = Some(Box::pin(tokio::time::sleep(sleep_dur)));
-                    }
-                }
-                None => {
-                    sleep_timer = None;
-                }
-            };
+            orphan_expiration_timer.arm(self.next_orphan_connection_expiration());
             tokio::select! {
                 maybe = self.tx_inlet.recv() => {
                     match maybe {
@@ -3087,7 +3227,7 @@ where
                         }
                     }
                 }
-                _ = async { sleep_timer.as_mut().unwrap().await }, if sleep_timer.is_some() => {
+                _ = orphan_expiration_timer.expired(), if orphan_expiration_timer.is_armed() => {
                     self.try_evict_orphan_connections();
                 }
                 () = &mut prediction_timer => {
@@ -3831,6 +3971,61 @@ mod test {
 
         let actual = set.iter().count();
         assert_eq!(actual, 0);
+    }
+}
+
+#[cfg(test)]
+mod orphan_expiration_timer_test {
+    use {
+        super::OrphanExpirationTimer,
+        std::{
+            pin::pin,
+            time::{Duration, Instant},
+        },
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn it_should_wait_for_the_next_expiration_after_firing() {
+        // Orphan connections expiring at 10s and 15s.
+        let start = tokio::time::Instant::now();
+        let mut timer = OrphanExpirationTimer::default();
+        timer.arm(Some(Instant::now() + Duration::from_secs(10)));
+        timer.expired().await;
+        assert!(start.elapsed() >= Duration::from_secs(10));
+        assert!(!timer.is_armed());
+
+        // The 10s connection is evicted, the 15s one remains.
+        timer.arm(Some(Instant::now() + Duration::from_secs(5)));
+        {
+            let mut expired = pin!(timer.expired());
+            assert!(futures::poll!(expired.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(4)).await;
+            assert!(futures::poll!(expired.as_mut()).is_pending());
+            expired.await;
+        }
+        assert!(start.elapsed() >= Duration::from_secs(15));
+        assert!(!timer.is_armed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn it_should_keep_the_armed_deadline_until_it_fires() {
+        let start = tokio::time::Instant::now();
+        let mut timer = OrphanExpirationTimer::default();
+        timer.arm(Some(Instant::now() + Duration::from_secs(10)));
+        timer.arm(Some(Instant::now() + Duration::from_secs(20)));
+        timer.expired().await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_secs(10));
+        assert!(elapsed < Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn it_should_disarm_when_no_orphan_connection_is_left() {
+        let mut timer = OrphanExpirationTimer::default();
+        timer.arm(Some(Instant::now() + Duration::from_secs(10)));
+        assert!(timer.is_armed());
+        timer.arm(None);
+        assert!(!timer.is_armed());
     }
 }
 
