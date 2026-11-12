@@ -43,6 +43,7 @@ use {
         setup_tracing,
         solana_rpc_utils::{RetryRpcSender, RetryRpcSenderStrategy},
         stake::{self, StakeInfoMap, spawn_cache_stake_info_map},
+        tip::{MinTipLamports, TipAccounts},
         transaction_handler::TransactionHandler,
         transactions::{
             DropExpiredTransactions, FanoutConfig, SendTransactionRequest, TransactionFanout,
@@ -81,6 +82,17 @@ struct Args {
     #[clap(long, help = "prometheus bind address for scraping metrics")]
     pub prometheus: Option<SocketAddr>,
 
+    /// Path to a text file listing, one per line, the addresses a transaction sent to
+    /// `/send-via-tip` may tip. Without it, `/send-via-tip` rejects every transaction.
+    #[clap(long)]
+    pub tipping_addr_file: Option<PathBuf>,
+
+    /// Smallest tip, in lamports, a transaction sent to `/send-via-tip` must transfer to a
+    /// tipping address. A tip is always at least 1 lamport. Can be changed at runtime with
+    /// `jet admin set-min-tip-lamports`.
+    #[clap(long, default_value_t = 10_000)]
+    pub min_tip_lamports: u64,
+
     #[command(subcommand)]
     pub command: Option<ArgsCommands>,
 }
@@ -106,6 +118,14 @@ enum ArgsCommandAdmin {
     },
     /// Reset identity
     ResetIdentityKeypair,
+    /// Print the smallest tip, in lamports, `/send-via-tip` accepts
+    GetMinTipLamports,
+    /// Set the smallest tip, in lamports, `/send-via-tip` accepts, until jet restarts
+    SetMinTipLamports {
+        /// New minimum tip, in lamports
+        #[clap(long)]
+        lamports: u64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -124,6 +144,11 @@ fn main() -> anyhow::Result<()> {
 async fn main2() -> anyhow::Result<()> {
     let args = Args::parse();
     let config: ConfigJet = load_config(&args.config).await?;
+    let tip_accounts = args
+        .tipping_addr_file
+        .as_deref()
+        .map(TipAccounts::load)
+        .transpose()?;
     if args.check {
         return Ok(());
     }
@@ -132,7 +157,7 @@ async fn main2() -> anyhow::Result<()> {
 
     match args.command {
         Some(ArgsCommands::Admin { cmd }) => run_cmd_admin(config, cmd).await,
-        None => run_jet(config, args.prometheus).await,
+        None => run_jet(config, args.prometheus, tip_accounts, args.min_tip_lamports).await,
     }
 }
 
@@ -187,6 +212,15 @@ async fn run_cmd_admin(config: ConfigJet, admin_cmd: ArgsCommandAdmin) -> anyhow
         }
         ArgsCommandAdmin::ResetIdentityKeypair => {
             client.reset_identity().await?;
+        }
+        ArgsCommandAdmin::GetMinTipLamports => {
+            let lamports = client.get_min_tip_lamports().await?;
+            println!("{lamports}");
+        }
+        ArgsCommandAdmin::SetMinTipLamports { lamports } => {
+            let previous = client.get_min_tip_lamports().await?;
+            client.set_min_tip_lamports(lamports).await?;
+            println!("Successfully updated min tip lamports from {previous} to {lamports}");
         }
     }
 
@@ -269,6 +303,8 @@ impl TpuSenderResponseCallback for JetTpuCallback {
 async fn run_jet(
     config: ConfigJet,
     prometheus_bind_addr: Option<SocketAddr>,
+    tip_accounts: Option<TipAccounts>,
+    min_tip_lamports: u64,
 ) -> anyhow::Result<()> {
     let mut tg = JoinSet::default();
     let mut tg_name_map = HashMap::<task::Id, String>::new();
@@ -345,7 +381,6 @@ async fn run_jet(
 
     let (geyser, geyser_handle) = GeyserSubscriber::new(
         config.upstream.grpc.clone(),
-        false,
         jet_cancellation_token.child_token(),
     );
     let blockhash_queue = BlockhashQueue::new(geyser.subscribe_block_meta());
@@ -429,10 +464,20 @@ async fn run_jet(
     let tx_handler =
         TransactionHandler::new(root_txn_inlet, config.listen_solana_like.fail_on_preflight);
 
+    match &tip_accounts {
+        Some(tip_accounts) => info!(
+            tipping_addresses = tip_accounts.len(),
+            min_tip_lamports, "send-via-tip endpoint enabled"
+        ),
+        None => warn!("send-via-tip endpoint disabled: no --tipping-addr-file"),
+    }
+    let min_tip_lamports = Arc::new(MinTipLamports::new(min_tip_lamports));
     let rpc_solana_like = SolanaLikeServer::new(
         config.listen_solana_like.bind[0],
         tx_handler.clone(),
         config.log_invalid_txn,
+        tip_accounts,
+        Arc::clone(&min_tip_lamports),
     )
     .await;
 
@@ -444,6 +489,7 @@ async fn run_jet(
         config.identity.expected,
         Arc::new(cluster_tpu_info),
         shared_tpu_activity_tracker,
+        min_tip_lamports,
     )
     .await;
 
